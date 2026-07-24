@@ -1,0 +1,27 @@
+{
+  "default_submit_mode": {
+    "description": "默认投稿权限模式（群未单独设置时使用）",
+    "type": "int",
+    "hint": "0：关闭投稿；1：仅管理员可投稿；2：全体可投稿",
+    "default": 0,
+    "options": [0, 1, 2]
+  },
+  "default_cooldown": {
+    "description": "戳一戳随机语录的默认冷却时间（秒）",
+    "type": "int",
+    "hint": "同一群聊在冷却时间内戳一戳不会再次触发语录",
+    "default": 10
+  },
+  "poke_quote_probability": {
+    "description": "被戳时发送语录的概率",
+    "type": "float",
+    "hint": "0~1 之间，剩余概率将发送随机趣味文本",
+    "default": 0.85
+  },
+  "recent_window": {
+    "description": "随机去重窗口大小",
+    "type": "int",
+    "hint": "最近被抽到的若干张语录会被降低重复概率，避免短期内连续刷到同一张",
+    "default": 8
+  }
+}

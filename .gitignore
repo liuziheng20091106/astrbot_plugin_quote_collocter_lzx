@@ -1,0 +1,32 @@
+# docs 目录为插件开发指导，不纳入仓库
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AstrBot 运行时数据（持久化数据存放于 data 目录，不应进仓库）
+data/
+
+# 日志
+*.log
+
+# 操作系统
+.DS_Store
+Thumbs.db
