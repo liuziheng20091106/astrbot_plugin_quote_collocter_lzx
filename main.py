@@ -275,6 +275,7 @@ class QuotePlugin(Star):
             yield event.plain_result(
                 "⭐本群还没有群友语录哦~\n请发送“/语录投稿+图片”来添加！"
             )
+        event.stop_event()
 
     # ------------------------------------------------------------------ #
     # 指令：语录投稿
@@ -293,9 +294,11 @@ class QuotePlugin(Star):
             yield event.plain_result(
                 "⭐投稿系统未开启，请联系 bot 管理员使用 /投稿权限 开启"
             )
+            event.stop_event()
             return
         if mode == 1 and not self._is_admin(event):
             yield event.plain_result("⭐权限不足，当前仅 bot 管理员可投稿")
+            event.stop_event()
             return
 
         # 解析图片 file_id：当前消息图片 或 被回复消息中的图片
@@ -317,6 +320,7 @@ class QuotePlugin(Star):
                     ),
                 ]
             )
+            event.stop_event()
             return
 
         path = await self._download_image(event, file_id, group_id)
@@ -328,6 +332,7 @@ class QuotePlugin(Star):
             yield event.chain_result(
                 [Comp.Reply(id=msg_id), Comp.Plain(text="⭐语录投稿失败，图片下载失败")]
             )
+        event.stop_event()
 
     # ------------------------------------------------------------------ #
     # 指令：查看群状态
@@ -357,6 +362,7 @@ class QuotePlugin(Star):
             f"  投稿权限：{mode_text}\n"
             f"  戳戳冷却：{int(settings.get('cooldown', 10))} 秒"
         )
+        event.stop_event()
 
     # ------------------------------------------------------------------ #
     # 指令：设置投稿权限（仅管理员）
@@ -371,12 +377,14 @@ class QuotePlugin(Star):
             yield event.plain_result(
                 "⭐模式只能是 0、1、2\n  0：关闭\n  1：仅管理员\n  2：全体成员"
             )
+            event.stop_event()
             return
         settings = self._load_settings(group_id)
         settings["mode"] = mode
         self._save_settings(group_id, settings)
         text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}[mode]
         yield event.plain_result(f"⭐投稿权限已设置为：{text}")
+        event.stop_event()
 
     # ------------------------------------------------------------------ #
     # 指令：设置戳戳冷却（仅管理员）
@@ -389,11 +397,13 @@ class QuotePlugin(Star):
         group_id = str(event.message_obj.group_id)
         if cooldown < 0:
             yield event.plain_result("⭐冷却时间不能为负数")
+            event.stop_event()
             return
         settings = self._load_settings(group_id)
         settings["cooldown"] = cooldown
         self._save_settings(group_id, settings)
         yield event.plain_result(f"⭐戳戳冷却已设置为：{cooldown} 秒")
+        event.stop_event()
 
     # ------------------------------------------------------------------ #
     # 监听：戳一戳触发随机语录
@@ -438,12 +448,14 @@ class QuotePlugin(Star):
             path = self._shuffler(group_id).next()
             if path:
                 yield event.image_result(path)
+                event.stop_event()
             # 无语录时静默
             return
         else:
             yield event.chain_result(
                 [Comp.At(qq=sender_id), Comp.Plain(text=random.choice(POKE_TEXTS))]
             )
+            event.stop_event()
 
     # ------------------------------------------------------------------ #
     # 工具
