@@ -27,6 +27,44 @@ POKE_TEXTS = [
     "给我出列！",
 ]
 
+# 语录稀有度文本（对应文件名首位数字 5..1，不在映射内的数字按 1=新卡 处理）
+RARITY_TEXT = {
+    5: "恭喜抽到SSSR卡",
+    4: "您抽到了SSR卡",
+    3: "您抽到了SR卡",
+    2: "您抽到了R卡",
+    1: "您抽到了新卡",
+}
+
+
+def parse_quote_rarity(filename: str) -> tuple[int, str]:
+    """解析 '<0-5>.<string>.<ext>' 格式的文件名。
+
+    返回 (稀有度数字, 展示名)。
+    展示名 = 文件名中的 [string] + 文件扩展名。
+    不符合格式的文件名按稀有度 1（新卡）处理，展示名为去掉编号后的原文。
+    """
+    p = Path(filename)
+    ext = p.suffix
+    stem = p.stem
+    parts = stem.split(".", 1)
+    if len(parts) == 2 and parts[0].isdigit():
+        rarity = int(parts[0])
+        if rarity not in RARITY_TEXT:
+            rarity = 1
+        string = parts[1]
+    else:
+        rarity = 1
+        string = stem
+    return rarity, f"{string}{ext}"
+
+
+def quote_chain(path: str) -> list:
+    """根据语录图片路径构建 [图片 + 稀有度文本] 消息链。"""
+    rarity, display = parse_quote_rarity(Path(path).name)
+    text = f"{RARITY_TEXT[rarity]}\n{display}"
+    return [Comp.Image.fromFileSystem(path), Comp.Plain(text=text)]
+
 
 class QuoteShuffler:
     """群聊语录随机抽取器。
@@ -168,11 +206,9 @@ class QuotePlugin(Star):
     # ------------------------------------------------------------------ #
     # 图片下载
     # ------------------------------------------------------------------ #
-    async def _save_bytes(self, group_id: str, data: bytes, ext: str = ".jpg") -> str:
-        """将图片字节写入群目录，返回保存路径。"""
+    async def _save_bytes(self, group_id: str, data: bytes, filename: str) -> str:
+        """将图片字节写入群目录，按指定文件名保存，返回保存路径。"""
         d = self._ensure_group_dir(group_id)
-        # 用纳秒级时间戳 + 随机串，避免并发冲突
-        filename = f"image_{int(time.time() * 1000)}_{random.randint(1000, 9999)}{ext}"
         path = d / filename
         with open(path, "wb") as f:
             f.write(data)
@@ -180,9 +216,9 @@ class QuotePlugin(Star):
         return str(path)
 
     async def _download_image(
-        self, event: AstrMessageEvent, file_id: str, group_id: str
+        self, event: AstrMessageEvent, file_id: str, group_id: str, filename: str
     ) -> str | None:
-        """三级容错下载图片：本地缓存 -> 协议端 API -> URL 下载。"""
+        """三级容错下载图片：本地缓存 -> 协议端 API -> URL 下载，保存为指定文件名。"""
         try:
             assert isinstance(event, AiocqhttpMessageEvent)
             client = event.bot
@@ -198,7 +234,9 @@ class QuotePlugin(Star):
                     if local_path and os.path.exists(local_path):
                         logger.info(f"从本地缓存读取图片: {local_path}")
                         with open(local_path, "rb") as f:
-                            return await self._save_bytes(group_id, f.read())
+                            return await self._save_bytes(
+                                group_id, f.read(), filename
+                            )
                 except Exception as e:
                     logger.warning(f"读取本地缓存失败: {e}")
 
@@ -209,7 +247,7 @@ class QuotePlugin(Star):
                 if api_path and os.path.exists(api_path):
                     logger.info(f"从协议端 API 读取图片: {api_path}")
                     with open(api_path, "rb") as f:
-                        return await self._save_bytes(group_id, f.read())
+                        return await self._save_bytes(group_id, f.read(), filename)
             except Exception as e:
                 logger.warning(f"通过 get_image API 下载失败: {e}")
                 result = None
@@ -223,7 +261,7 @@ class QuotePlugin(Star):
                         async with session.get(url) as resp:
                             if resp.status == 200:
                                 return await self._save_bytes(
-                                    group_id, await resp.read()
+                                    group_id, await resp.read(), filename
                                 )
                             logger.error(f"从 URL 下载失败: HTTP {resp.status}")
                 except Exception as e:
@@ -235,8 +273,14 @@ class QuotePlugin(Star):
             logger.error(f"下载图片异常: {e}")
             return None
 
-    async def _resolve_reply_image_file(self, event: AstrMessageEvent) -> str | None:
-        """从被回复的消息中解析出图片 file_id（兼容数组/ CQ 码两种格式）。"""
+    async def _resolve_reply_image_file(
+        self, event: AstrMessageEvent
+    ) -> tuple[str, str] | None:
+        """从被回复的消息中解析出 (图片 file_id, 推断的扩展名)。
+
+        兼容数组/ CQ 码两种格式。扩展名优先取图 URL 后缀，否则取 file 字段后缀，
+        无法判断时回退到 .jpg。
+        """
         reply = next(
             (c for c in event.message_obj.message if isinstance(c, Comp.Reply)), None
         )
@@ -248,17 +292,48 @@ class QuotePlugin(Star):
             if not reply_msg or "message" not in reply_msg:
                 return None
             chain = reply_msg["message"]
-            if isinstance(chain, list):
-                for part in chain:
-                    if isinstance(part, dict) and part.get("type") == "image":
-                        return part.get("data", {}).get("file")
-            elif isinstance(chain, str):
+            parts = chain if isinstance(chain, list) else []
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    data = part.get("data", {}) or {}
+                    file_id = data.get("file")
+                    ext = self._detect_ext(data.get("url"), data.get("file"))
+                    return file_id, ext
+            if isinstance(chain, str):
                 m = re.search(r"\[CQ:image,[^\]]*file=([^,\]]+)", chain)
                 if m:
-                    return m.group(1)
+                    return m.group(1), self._detect_ext(None, m.group(1))
         except Exception as e:
             logger.error(f"获取引用消息图片失败: {e}")
         return None
+
+    @staticmethod
+    def _detect_ext(url: str | None, file: str | None) -> str:
+        """从图片 URL 或 file 字段推断扩展名，回退 .jpg。"""
+        for src in (url, file):
+            if not src:
+                continue
+            lower = src.lower().split("?", 1)[0]
+            for ext in IMAGE_EXTENSIONS:
+                if lower.endswith(ext):
+                    return ext
+        return ".jpg"
+
+    def _log_submission(
+        self, group_id: str, user_id: str, filename: str, ts: float
+    ) -> None:
+        """将一次投稿记录追加到插件数据目录下的 submit.log。"""
+        QUOTES_ROOT.mkdir(parents=True, exist_ok=True)
+        log_path = QUOTES_ROOT / "submit.log"
+        line = (
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}] "
+            f"群:{group_id} 投稿人:{user_id} 文件:{filename}\n"
+        )
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as e:
+            logger.error(f"写入投稿日志失败: {e}")
 
     # ------------------------------------------------------------------ #
     # 指令：随机查看一条语录
@@ -270,7 +345,7 @@ class QuotePlugin(Star):
         group_id = str(event.message_obj.group_id)
         path = self._shuffler(group_id).next()
         if path:
-            yield event.image_result(path)
+            yield event.chain_result(quote_chain(path))
         else:
             yield event.plain_result(
                 "⭐本群还没有群友语录哦~\n请发送“/语录投稿+图片”来添加！"
@@ -282,8 +357,8 @@ class QuotePlugin(Star):
     # ------------------------------------------------------------------ #
     @filter.command("语录投稿", alias={"投稿语录"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
-    async def submit_quote(self, event: AstrMessageEvent):
-        """投稿一张群友语录图片（可直接带图，或回复一条含图消息）"""
+    async def submit_quote(self, event: AstrMessageEvent, title: str = ""):
+        """回复一张含图消息进行语录投稿，可选附带标题作为文件名"""
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
         msg_id = str(event.message_obj.message_id)
@@ -301,30 +376,36 @@ class QuotePlugin(Star):
             event.stop_event()
             return
 
-        # 解析图片 file_id：当前消息图片 或 被回复消息中的图片
-        image_comp = next(
-            (c for c in event.message_obj.message if isinstance(c, Comp.Image)), None
-        )
-        file_id = (
-            image_comp.file
-            if image_comp
-            else await self._resolve_reply_image_file(event)
-        )
-
-        if not file_id:
+        # 必须（也仅）通过回复一条含图消息来投稿
+        resolved = await self._resolve_reply_image_file(event)
+        if not resolved:
             yield event.chain_result(
                 [
                     Comp.At(qq=user_id),
                     Comp.Plain(
-                        text="\n你是不是忘发图啦？\n请“/语录投稿+图片”或“回复含图消息并发送 /语录投稿”"
+                        text=(
+                            "\n请回复一条含图消息并发送“/语录投稿 [标题]”进行投稿。\n"
+                            "示例：/语录投稿 杰克的奇妙比喻"
+                        )
                     ),
                 ]
             )
             event.stop_event()
             return
+        file_id, ext = resolved
 
-        path = await self._download_image(event, file_id, group_id)
+        # 决定文件名：未给标题则用“xxxx年xx月xx日xx:xx的投稿”
+        ts = time.time()
+        if title:
+            stem = title.strip()
+        else:
+            stem = time.strftime("%Y年%m月%d日%H:%M的投稿", time.localtime(ts))
+        filename = f"1.{stem}{ext}"
+
+        path = await self._download_image(event, file_id, group_id, filename)
         if path and os.path.exists(path):
+            # 投稿成功，写入投稿日志
+            self._log_submission(group_id, user_id, filename, ts)
             yield event.chain_result(
                 [Comp.Reply(id=msg_id), Comp.Plain(text="⭐语录投稿成功！")]
             )
@@ -447,7 +528,7 @@ class QuotePlugin(Star):
         if random.random() < prob:
             path = self._shuffler(group_id).next()
             if path:
-                yield event.image_result(path)
+                yield event.chain_result(quote_chain(path))
                 event.stop_event()
             # 无语录时静默
             return
