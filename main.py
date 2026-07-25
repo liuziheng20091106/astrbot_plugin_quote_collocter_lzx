@@ -75,10 +75,14 @@ def parse_quote_rarity(filename: str) -> tuple[int, str]:
 
 
 def quote_chain(path: str) -> list:
-    """根据语录图片路径构建 [图片 + 稀有度文本] 消息链。"""
+    """根据语录图片路径构建 [稀有度文本 + 图片] 消息链。
+
+    文本放在图片之前：aiocqhttp / OneBot v11 对位于图片之后的 Plain 文本
+    常会丢弃，采用「文字在前、图片在后」以保证文字可见。
+    """
     rarity, display = parse_quote_rarity(Path(path).name)
     text = f"{RARITY_TEXT[rarity]}\n{display}"
-    return [Comp.Image.fromFileSystem(path), Comp.Plain(text=text)]
+    return [Comp.Plain(text=text), Comp.Image.fromFileSystem(path)]
 
 
 class QuoteShuffler:
