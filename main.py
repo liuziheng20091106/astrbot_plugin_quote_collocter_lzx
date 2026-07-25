@@ -69,15 +69,19 @@ def quote_chain(path: str) -> list:
 class QuoteShuffler:
     """群聊语录随机抽取器。
 
-    采用「打乱顺序 + 指针递增」的算法，保证一轮之内不会重复抽到同一张图片；
-    同时通过 recent_window 避免新一局开头立刻复现上一局末尾的图片。
+    采用「按稀有度加权不放回抽样 + 指针递增」的算法：
+    一轮之内每张图片恰好出现一次（不重复），但高权重（按稀有度配置）
+    的图片倾向排到队列更靠前，更早被抽到；一轮走完后重新加权洗牌。
+    通过 recent_window 避免新一局开头立刻复现上一局末尾的图片。
     抽取队列持久化到群目录下的 order.json，重启后可继续。
     """
 
-    def __init__(self, group_dir: Path, window: int):
+    def __init__(self, group_dir: Path, window: int, weights: dict | None = None):
         self.group_dir = group_dir
         self.order_file = group_dir / "order.json"
         self.window = max(1, int(window))
+        # 稀有度 -> 权重，缺省按 parse_quote_rarity 的默认（1）再兜底 1.0
+        self.weights = weights or {}
 
     def _list_images(self) -> list[str]:
         if not self.group_dir.exists():
@@ -105,10 +109,32 @@ class QuoteShuffler:
         except Exception as e:
             logger.error(f"保存抽取队列失败: {e}")
 
+    def _weight_of(self, filename: str) -> float:
+        """按文件名的稀有度查权重，未配置的稀有度回退到 1.0。"""
+        rarity, _ = parse_quote_rarity(filename)
+        return float(self.weights.get(rarity, 1.0) or 1.0)
+
+    def _weighted_shuffle(self, images: list[str]) -> list[str]:
+        """按稀有度权重做不放回抽样，返回一个全排列。
+
+        高权重的图片更早被选中（排到队列更前面），一轮内仍每张各出现一次。
+        所有权重之和 <= 0 时回退为均匀洗牌。
+        """
+        pool = list(images)
+        weights = [self._weight_of(name) for name in pool]
+        if sum(weights) <= 0:
+            random.shuffle(pool)
+            return pool
+        out: list[str] = []
+        while pool:
+            i = random.choices(range(len(pool)), weights=weights, k=1)[0]
+            out.append(pool.pop(i))
+            weights.pop(i)
+        return out
+
     def _build_order(self, images: list[str], avoid: set[str]) -> dict:
-        """根据当前图片列表生成一个新的打乱顺序。"""
-        queue = list(images)
-        random.shuffle(queue)
+        """根据当前图片列表生成一个新的加权抽取顺序。"""
+        queue = self._weighted_shuffle(images)
         # 尽量让新的开头不要是上一局末尾几张，避免连续重复
         head = queue[: self.window]
         tail = queue[self.window :]
@@ -195,11 +221,23 @@ class QuotePlugin(Star):
         except Exception as e:
             logger.error(f"保存群设置失败: {e}")
 
+    def _load_rarity_weights(self) -> dict:
+        """从配置读取稀有度权重，整理成 {稀有度数字: 权重}。"""
+        raw = self.config.get("rarity_weights") or {}
+        return {
+            5: float(raw.get("weight_5", 3) or 1.0),
+            4: float(raw.get("weight_4", 5) or 1.0),
+            3: float(raw.get("weight_3", 8) or 1.0),
+            2: float(raw.get("weight_2", 4) or 1.0),
+            1: float(raw.get("weight_1", 2) or 1.0),
+        }
+
     def _shuffler(self, group_id: str) -> QuoteShuffler:
         if group_id not in self._shufflers:
             self._shufflers[group_id] = QuoteShuffler(
                 self._group_dir(group_id),
                 int(self.config.get("recent_window", 8)),
+                self._load_rarity_weights(),
             )
         return self._shufflers[group_id]
 
@@ -234,9 +272,7 @@ class QuotePlugin(Star):
                     if local_path and os.path.exists(local_path):
                         logger.info(f"从本地缓存读取图片: {local_path}")
                         with open(local_path, "rb") as f:
-                            return await self._save_bytes(
-                                group_id, f.read(), filename
-                            )
+                            return await self._save_bytes(group_id, f.read(), filename)
                 except Exception as e:
                     logger.warning(f"读取本地缓存失败: {e}")
 
