@@ -1,0 +1,175 @@
+:root {
+  --bg: #ffffff;
+  --card-bg: #fafafa;
+  --text: #1a1a1a;
+  --muted: #888;
+  --border: #e0e0e0;
+  --accent: #4a90e2;
+  --sssr: #ff4d4f;
+  --ssr: #ff7a45;
+  --sr: #faad14;
+  --r: #52c41a;
+  --new: #8c8c8c;
+}
+
+[data-theme="dark"] {
+  --bg: #1a1a1a;
+  --card-bg: #242424;
+  --text: #e0e0e0;
+  --muted: #888;
+  --border: #333;
+  --accent: #4a90e2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+}
+
+header {
+  margin-bottom: 16px;
+}
+header h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+.subtitle {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 900px;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+.card h3 {
+  margin: 18px 0 8px;
+  font-size: 14px;
+}
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 12px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+.settings-grid label,
+.log-toolbar label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.settings-grid span,
+.log-toolbar span {
+  color: var(--muted);
+}
+
+input,
+select,
+button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+button {
+  cursor: pointer;
+  padding: 6px 14px;
+}
+button:hover {
+  border-color: var(--accent);
+}
+.actions {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rarity-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rarity-row {
+  display: grid;
+  grid-template-columns: 80px 1fr 70px;
+  align-items: center;
+  gap: 10px;
+}
+.rarity-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+input[type="range"] {
+  padding: 0;
+}
+
+.log-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.log-table-wrap {
+  overflow-x: auto;
+  max-height: 360px;
+  overflow-y: auto;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th,
+td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+th {
+  position: sticky;
+  top: 0;
+  background: var(--card-bg);
+}
+
+.msg {
+  font-size: 12px;
+  margin-top: 8px;
+}
+.msg.ok {
+  color: var(--r);
+}
+.msg.err {
+  color: var(--sssr);
+}

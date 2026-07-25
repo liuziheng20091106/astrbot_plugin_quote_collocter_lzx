@@ -10,12 +10,27 @@ import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
+from astrbot.api.web import json_response, error_response, request
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
 
+PLUGIN_NAME = "quote_collocter"
+
 # 群友语录图片存放根目录（遵循 AstrBot 存储大文件规范：data/plugin_data/{插件名}）
 QUOTES_ROOT = Path("data") / "plugin_data" / "quote_collocter"
+
+# 全局设置文件（供 WebUI Page 与插件共享读写）
+GLOBAL_SETTINGS_PATH = QUOTES_ROOT / "settings.json"
+
+# 默认稀有度权重（面板与 _conf_schema.json 默认值保持一致）
+DEFAULT_RARITY_WEIGHTS = {
+    "weight_5": 3,
+    "weight_4": 5,
+    "weight_3": 8,
+    "weight_2": 4,
+    "weight_1": 2,
+}
 
 # 支持的图片扩展名
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
@@ -182,6 +197,25 @@ class QuotePlugin(Star):
         self.config = config
         # 群 -> QuoteShuffler
         self._shufflers: dict[str, QuoteShuffler] = {}
+        # 注册 WebUI Page 后端 API
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/settings",
+            self.web_get_settings,
+            ["GET"],
+            "Get quote plugin settings",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/settings/save",
+            self.web_save_settings,
+            ["POST"],
+            "Save quote plugin settings",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/submit-log",
+            self.web_submit_log,
+            ["GET"],
+            "Get submission log",
+        )
 
     # ------------------------------------------------------------------ #
     # 路径与持久化
@@ -197,11 +231,58 @@ class QuotePlugin(Star):
     def _settings_path(self, group_id: str) -> Path:
         return self._group_dir(group_id) / "settings.json"
 
+    # ------------------------------------------------------------------ #
+    # 全局设置（WebUI Page 与插件共享，settings.json）
+    # ------------------------------------------------------------------ #
+    def _default_global_settings(self) -> dict:
+        """全局设置默认值，与 _conf_schema.json 镜像保持一致。"""
+        return {
+            "default_submit_mode": int(self.config.get("default_submit_mode", 0)),
+            "default_cooldown": int(self.config.get("default_cooldown", 10)),
+            "poke_quote_probability": float(
+                self.config.get("poke_quote_probability", 0.85)
+            ),
+            "recent_window": int(self.config.get("recent_window", 8)),
+            "rarity_weights": {
+                **DEFAULT_RARITY_WEIGHTS,
+                **(self.config.get("rarity_weights") or {}),
+            },
+        }
+
+    def _load_global_settings(self) -> dict:
+        """读取全局设置，缺失字段回退到默认值。"""
+        data = self._default_global_settings()
+        try:
+            if GLOBAL_SETTINGS_PATH.exists():
+                with open(GLOBAL_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                    saved = json.load(f) or {}
+                # 逐字段合并，保留新加默认、用已保存值覆盖
+                for k, v in data.items():
+                    if k in saved:
+                        if isinstance(v, dict):
+                            merged = dict(v)
+                            merged.update(saved.get(k) or {})
+                            data[k] = merged
+                        else:
+                            data[k] = saved[k]
+        except Exception as e:
+            logger.warning(f"读取全局设置失败: {e}")
+        return data
+
+    def _save_global_settings(self, settings: dict) -> None:
+        try:
+            QUOTES_ROOT.mkdir(parents=True, exist_ok=True)
+            with open(GLOBAL_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存全局设置失败: {e}")
+
     def _load_settings(self, group_id: str) -> dict:
-        """读取群级设置，合并全局默认值。"""
+        """读取群级设置，合并全局设置作为默认。"""
+        gs = self._load_global_settings()
         data = {
-            "mode": int(self.config.get("default_submit_mode", 0)),
-            "cooldown": int(self.config.get("default_cooldown", 10)),
+            "mode": int(gs.get("default_submit_mode", 0)),
+            "cooldown": int(gs.get("default_cooldown", 10)),
             "last_poke": 0,
         }
         path = self._settings_path(group_id)
@@ -222,21 +303,23 @@ class QuotePlugin(Star):
             logger.error(f"保存群设置失败: {e}")
 
     def _load_rarity_weights(self) -> dict:
-        """从配置读取稀有度权重，整理成 {稀有度数字: 权重}。"""
-        raw = self.config.get("rarity_weights") or {}
+        """优先从全局设置读取稀有度权重，整理成 {稀有度数字: 权重}。"""
+        gs = self._load_global_settings()
+        raw = gs.get("rarity_weights") or DEFAULT_RARITY_WEIGHTS
         return {
-            5: float(raw.get("weight_5", 3) or 1.0),
-            4: float(raw.get("weight_4", 5) or 1.0),
-            3: float(raw.get("weight_3", 8) or 1.0),
-            2: float(raw.get("weight_2", 4) or 1.0),
-            1: float(raw.get("weight_1", 2) or 1.0),
+            5: float(raw.get("weight_5", DEFAULT_RARITY_WEIGHTS["weight_5"]) or 1.0),
+            4: float(raw.get("weight_4", DEFAULT_RARITY_WEIGHTS["weight_4"]) or 1.0),
+            3: float(raw.get("weight_3", DEFAULT_RARITY_WEIGHTS["weight_3"]) or 1.0),
+            2: float(raw.get("weight_2", DEFAULT_RARITY_WEIGHTS["weight_2"]) or 1.0),
+            1: float(raw.get("weight_1", DEFAULT_RARITY_WEIGHTS["weight_1"]) or 1.0),
         }
 
     def _shuffler(self, group_id: str) -> QuoteShuffler:
         if group_id not in self._shufflers:
+            gs = self._load_global_settings()
             self._shufflers[group_id] = QuoteShuffler(
                 self._group_dir(group_id),
-                int(self.config.get("recent_window", 8)),
+                int(gs.get("recent_window", 8)),
                 self._load_rarity_weights(),
             )
         return self._shufflers[group_id]
@@ -358,16 +441,19 @@ class QuotePlugin(Star):
     def _log_submission(
         self, group_id: str, user_id: str, filename: str, ts: float
     ) -> None:
-        """将一次投稿记录追加到插件数据目录下的 submit.log。"""
+        """将一次投稿记录以 JSONL 追加到插件数据目录下的 submit.log。"""
         QUOTES_ROOT.mkdir(parents=True, exist_ok=True)
         log_path = QUOTES_ROOT / "submit.log"
-        line = (
-            f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}] "
-            f"群:{group_id} 投稿人:{user_id} 文件:{filename}\n"
-        )
+        record = {
+            "ts": ts,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)),
+            "group_id": str(group_id),
+            "user_id": str(user_id),
+            "filename": filename,
+        }
         try:
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line)
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.error(f"写入投稿日志失败: {e}")
 
@@ -547,9 +633,7 @@ class QuotePlugin(Star):
 
         group_id = str(event.message_obj.group_id)
         settings = self._load_settings(group_id)
-        cooldown = int(
-            settings.get("cooldown", self.config.get("default_cooldown", 10))
-        )
+        cooldown = int(settings.get("cooldown", 10))
         last_poke = float(settings.get("last_poke", 0))
 
         if time.time() - last_poke < cooldown:
@@ -560,7 +644,8 @@ class QuotePlugin(Star):
         settings["last_poke"] = time.time()
         self._save_settings(group_id, settings)
 
-        prob = float(self.config.get("poke_quote_probability", 0.85))
+        gs = self._load_global_settings()
+        prob = float(gs.get("poke_quote_probability", 0.85))
         if random.random() < prob:
             path = self._shuffler(group_id).next()
             if path:
@@ -585,6 +670,106 @@ class QuotePlugin(Star):
             return str(event.get_sender_id()) in {str(a) for a in admins}
         except Exception:
             return False
+
+    # ------------------------------------------------------------------ #
+    # WebUI Page 后端 API
+    # ------------------------------------------------------------------ #
+    async def web_get_settings(self):
+        """读取全局设置，供 Page 渲染。"""
+        return json_response(self._load_global_settings())
+
+    async def web_save_settings(self):
+        """保存全局设置，校验后写回并使已缓存的 shuffler 失效。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象")
+
+        cur = self._load_global_settings()
+
+        # 默认投稿权限模式
+        if "default_submit_mode" in payload:
+            v = payload["default_submit_mode"]
+            if int(v) not in (0, 1, 2):
+                return error_response("default_submit_mode 必须是 0/1/2")
+            cur["default_submit_mode"] = int(v)
+
+        # 默认冷却（秒）
+        if "default_cooldown" in payload:
+            v = payload["default_cooldown"]
+            if int(v) < 0:
+                return error_response("default_cooldown 不能为负数")
+            cur["default_cooldown"] = int(v)
+
+        # 戳一戳触发概率
+        if "poke_quote_probability" in payload:
+            v = payload["poke_quote_probability"]
+            if not (0 <= float(v) <= 1):
+                return error_response("poke_quote_probability 必须在 0~1 之间")
+            cur["poke_quote_probability"] = float(v)
+
+        # 去重窗口
+        if "recent_window" in payload:
+            v = payload["recent_window"]
+            if int(v) < 1:
+                return error_response("recent_window 必须 >= 1")
+            cur["recent_window"] = int(v)
+
+        # 稀有度权重
+        if "rarity_weights" in payload:
+            rw = payload["rarity_weights"]
+            if not isinstance(rw, dict):
+                return error_response("rarity_weights 必须是对象")
+            keys = ["weight_5", "weight_4", "weight_3", "weight_2", "weight_1"]
+            for k in keys:
+                if k in rw:
+                    val = rw[k]
+                    try:
+                        f = float(val)
+                    except (TypeError, ValueError):
+                        return error_response(f"{k} 必须是数字")
+                    if f < 0:
+                        return error_response(f"{k} 不能为负")
+                    cur.setdefault("rarity_weights", {})[k] = f
+
+        self._save_global_settings(cur)
+        # 使已缓存的 shuffler 失效，下次重建会读取新权重/窗口
+        self._shufflers.clear()
+        return json_response(cur)
+
+    async def web_submit_log(self):
+        """返回投稿日志（JSONL 解析），支持按群号过滤和限制条数。"""
+        group_filter = request.query.get("group_id") or None
+        try:
+            limit = request.query.get("limit", 200, type=int)
+        except Exception:
+            limit = 200
+        if limit < 0:
+            limit = 200
+
+        log_path = QUOTES_ROOT / "submit.log"
+        records: list[dict] = []
+        if log_path.exists():
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        if group_filter and str(rec.get("group_id")) != str(
+                            group_filter
+                        ):
+                            continue
+                        records.append(rec)
+            except Exception as e:
+                logger.error(f"读取投稿日志失败: {e}")
+        # 按时间倒序，限制条数
+        records.sort(key=lambda r: float(r.get("ts", 0)), reverse=True)
+        records = records[:limit]
+        return json_response({"total": len(records), "items": records})
 
     async def terminate(self):
         """插件卸载时调用。"""

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>群友语录 管理面板</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1 data-i18n="title">群友语录 管理面板</h1>
+      <p class="subtitle" data-i18n="subtitle">查看投稿日志、调整稀有度权重与全局设置</p>
+    </header>
+
+    <main>
+      <!-- 设置区 -->
+      <section class="card">
+        <h2 data-i18n="settingsTitle">全局设置</h2>
+        <div class="settings-grid">
+          <label>
+            <span data-i18n="defaultSubmitMode">默认投稿权限模式</span>
+            <select id="default_submit_mode">
+              <option value="0">0 · 关闭</option>
+              <option value="1">1 · 仅管理员</option>
+              <option value="2">2 · 全体成员</option>
+            </select>
+          </label>
+          <label>
+            <span data-i18n="defaultCooldown">默认戳戳冷却（秒）</span>
+            <input id="default_cooldown" type="number" min="0" step="1" />
+          </label>
+          <label>
+            <span data-i18n="pokeProbability">戳一戳触发语录概率</span>
+            <input id="poke_quote_probability" type="number" min="0" max="1" step="0.01" />
+          </label>
+          <label>
+            <span data-i18n="recentWindow">去重窗口</span>
+            <input id="recent_window" type="number" min="1" step="1" />
+          </label>
+        </div>
+
+        <h3 data-i18n="rarityWeights">稀有度权重</h3>
+        <p class="hint" data-i18n="rarityHint">
+          数值越大越容易被抽到。默认 SR(3) 最易出，新卡(1) 与 SSSR(5) 被压低。
+        </p>
+        <div id="rarityWeights" class="rarity-grid">
+          <!-- JS 动态生成滑块 -->
+        </div>
+
+        <div class="actions">
+          <button id="saveSettings" data-i18n="save">保存设置</button>
+          <span id="settingsMsg" class="msg"></span>
+        </div>
+      </section>
+
+      <!-- 投稿日志区 -->
+      <section class="card">
+        <h2 data-i18n="logTitle">投稿日志</h2>
+        <div class="log-toolbar">
+          <label>
+            <span data-i18n="filterGroup">按群号过滤</span>
+            <input id="groupFilter" type="text" placeholder="群号" />
+          </label>
+          <label>
+            <span data-i18n="limit">条数上限</span>
+            <input id="logLimit" type="number" min="1" step="1" value="200" />
+          </label>
+          <button id="refreshLog" data-i18n="refresh">刷新日志</button>
+        </div>
+        <div class="log-table-wrap">
+          <table id="logTable">
+            <thead>
+              <tr>
+                <th data-i18n="colTime">时间</th>
+                <th data-i18n="colGroup">群号</th>
+                <th data-i18n="colUser">投稿人</th>
+                <th data-i18n="colFile">文件</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="logMsg" class="msg"></p>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
