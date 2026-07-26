@@ -461,6 +461,78 @@ class QuotePlugin(Star):
         except Exception as e:
             logger.error(f"写入投稿日志失败: {e}")
 
+    def _read_submit_log(self) -> list[dict]:
+        """读取全部投稿日志记录（JSONL）。"""
+        log_path = QUOTES_ROOT / "submit.log"
+        if not log_path.exists():
+            return []
+        out: list[dict] = []
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        out.append(json.loads(s))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error(f"读取投稿日志失败: {e}")
+        return out
+
+    def _rewrite_submit_log(self, records: list[dict]) -> None:
+        """用给定记录列表覆盖写入 submit.log。"""
+        log_path = QUOTES_ROOT / "submit.log"
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"重写投稿日志失败: {e}")
+
+    def _existing_displays(self, group_id: str) -> set[str]:
+        """返回该群已存在的「标题+扩展名」集合（忽略稀有度前缀 1-5）。"""
+        d = self._group_dir(group_id)
+        out: set[str] = set()
+        if not d.exists():
+            return out
+        for f in d.iterdir():
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
+                _, disp = parse_quote_rarity(f.name)
+                out.add(disp)
+        return out
+
+    def _find_quote_file(self, group_id: str, name: str) -> Path | None:
+        """按「完整文件名」或「展示名(标题+扩展名)」查找群目录下的语录文件。"""
+        d = self._group_dir(group_id)
+        if not d.exists():
+            return None
+        candidates = [
+            f
+            for f in d.iterdir()
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        target = name.strip()
+        # 1. 完整文件名精确匹配
+        for f in candidates:
+            if f.name == target:
+                return f
+        # 2. 展示名匹配（忽略稀有度前缀）
+        for f in candidates:
+            _, disp = parse_quote_rarity(f.name)
+            if disp == target:
+                return f
+        # 3. 旧「1.<target>」形式兼容
+        for f in candidates:
+            if f.name == f"1.{target}":
+                return f
+        return None
+
+    def _invalidate_shuffler(self, group_id: str) -> None:
+        """删除已缓存的 shuffler，使下次抽取按新文件列表重建队列。"""
+        self._shufflers.pop(str(group_id), None)
+
     # ------------------------------------------------------------------ #
     # 指令：随机查看一条语录
     # ------------------------------------------------------------------ #
@@ -528,12 +600,39 @@ class QuotePlugin(Star):
             stem = time.strftime("%Y年%m月%d日%H:%M的投稿", time.localtime(ts))
         filename = f"1.{stem}{ext}"
 
+        # 重名检测：已存在相同「标题+扩展名」的语录（忽略稀有度前缀 1-5）则拒绝
+        new_display = f"{stem}{ext}"
+        existing_displays = self._existing_displays(group_id)
+        if new_display in existing_displays:
+            yield event.chain_result(
+                [
+                    Comp.Reply(id=msg_id),
+                    Comp.Plain(
+                        text=(
+                            f"⭐投稿失败：已存在同名语录「{stem}」，请改个标题重试。\n"
+                            "如确需覆盖，请联系管理员使用 /语录删除 <名称> 删除后再投稿。"
+                        )
+                    ),
+                ]
+            )
+            event.stop_event()
+            return
+
         path = await self._download_image(event, file_id, group_id, filename)
         if path and os.path.exists(path):
             # 投稿成功，写入投稿日志
             self._log_submission(group_id, user_id, filename, ts)
             yield event.chain_result(
-                [Comp.Reply(id=msg_id), Comp.Plain(text="⭐语录投稿成功！")]
+                [
+                    Comp.Reply(id=msg_id),
+                    Comp.Plain(
+                        text=(
+                            "⭐语录投稿成功！\n"
+                            "请确认您的投稿格式正确（聊天记录截屏）。\n"
+                            "如果投稿有误，请使用「/撤回投稿 <名称>」取消投稿。"
+                        )
+                    ),
+                ]
             )
         else:
             yield event.chain_result(
@@ -610,6 +709,218 @@ class QuotePlugin(Star):
         settings["cooldown"] = cooldown
         self._save_settings(group_id, settings)
         yield event.plain_result(f"⭐戳戳冷却已设置为：{cooldown} 秒")
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：删除语录（仅管理员）
+    # ------------------------------------------------------------------ #
+    @filter.command("语录删除", alias={"删除语录"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def delete_quote(self, event: AstrMessageEvent, name: str = ""):
+        """按名称删除一条本群语录（可传完整文件名或展示名）"""
+        group_id = str(event.message_obj.group_id)
+        if not name.strip():
+            yield event.plain_result(
+                "⭐请输入要删除的语录名称，例如 /语录删除 杰克的奇妙比喻.jpg"
+            )
+            event.stop_event()
+            return
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"⭐未找到名为「{name}」的语录")
+            event.stop_event()
+            return
+        try:
+            target.unlink()
+            self._invalidate_shuffler(group_id)
+            yield event.plain_result(f"⭐已删除语录：{target.name}")
+        except Exception as e:
+            logger.error(f"删除语录失败: {e}")
+            yield event.plain_result(f"⭐删除失败: {e}")
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：重命名语录（仅管理员，改标题部分，保留稀有度与扩展名）
+    # ------------------------------------------------------------------ #
+    @filter.command("语录改名", alias={"改名语录"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def rename_quote(self, event: AstrMessageEvent, old: str = "", new: str = ""):
+        """重命名语录的标题部分，保留稀有度前缀与扩展名"""
+        # 由于指令以空格分参，若新标题含空格需手动重组
+        raw = event.message_str
+        parts = raw.split(maxsplit=2)[1:]  # 去掉指令名
+        old = parts[0] if len(parts) > 0 else ""
+        new = parts[1].strip() if len(parts) > 1 else ""
+        group_id = str(event.message_obj.group_id)
+        if not old or not new:
+            yield event.plain_result(
+                "⭐用法：/语录改名 <旧名称> <新标题>\n新标题可包含空格，但勿与已有语录重名"
+            )
+            event.stop_event()
+            return
+        target = self._find_quote_file(group_id, old)
+        if not target:
+            yield event.plain_result(f"⭐未找到名为「{old}」的语录")
+            event.stop_event()
+            return
+        rarity, _ = parse_quote_rarity(target.name)
+        ext = target.suffix
+        new_display = f"{new}{ext}"
+        if new_display in self._existing_displays(group_id):
+            yield event.plain_result(
+                f"⭐改名失败：已存在同名语录「{new}」，请换一个标题"
+            )
+            event.stop_event()
+            return
+        new_path = target.with_name(f"{rarity}.{new}{ext}")
+        if new_path.exists():
+            yield event.plain_result(f"⭐改名失败：目标文件已存在")
+            event.stop_event()
+            return
+        try:
+            target.rename(new_path)
+            self._invalidate_shuffler(group_id)
+            yield event.plain_result(f"⭐已重命名：\n{target.name} → {new_path.name}")
+        except Exception as e:
+            logger.error(f"重命名失败: {e}")
+            yield event.plain_result(f"⭐改名失败: {e}")
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：修改语录稀有度（仅管理员）
+    # ------------------------------------------------------------------ #
+    @filter.command("语录改稀有", alias={"改稀有语录", "语录改稀有度"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def change_rarity(
+        self, event: AstrMessageEvent, name: str = "", rarity: str = ""
+    ):
+        """修改语录稀有度前缀（1-5）"""
+        group_id = str(event.message_obj.group_id)
+        if not name.strip() or not rarity.strip():
+            yield event.plain_result("⭐用法：/语录改稀有 <名称> <1-5>")
+            event.stop_event()
+            return
+        try:
+            r = int(rarity)
+        except ValueError:
+            yield event.plain_result("⭐稀有度必须是 1-5 的整数")
+            event.stop_event()
+            return
+        if r not in RARITY_TEXT:
+            yield event.plain_result("⭐稀有度只能是 1-5")
+            event.stop_event()
+            return
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"⭐未找到名为「{name}」的语录")
+            event.stop_event()
+            return
+        ext = target.suffix
+        # 标题部分（不含稀有度数字），标题可能含点，仅按首个点分割
+        stem = target.stem.split(".", 1)[1] if "." in target.stem else target.stem
+        new_path = target.with_name(f"{r}.{stem}{ext}")
+        if new_path == target:
+            yield event.plain_result(f"⭐稀有度已是 {r}，无需修改")
+            event.stop_event()
+            return
+        if new_path.exists():
+            yield event.plain_result(f"⭐改稀有度失败：目标文件名已存在")
+            event.stop_event()
+            return
+        try:
+            target.rename(new_path)
+            self._invalidate_shuffler(group_id)
+            yield event.plain_result(
+                f"⭐已修改稀有度：\n{target.name} → {new_path.name}"
+            )
+        except Exception as e:
+            logger.error(f"改稀有度失败: {e}")
+            yield event.plain_result(f"⭐改稀有度失败: {e}")
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：撤回自己的投稿（仅本人）
+    # ------------------------------------------------------------------ #
+    @filter.command("撤回投稿", alias={"取消投稿", "撤回语录"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def revoke_quote(self, event: AstrMessageEvent, name: str = ""):
+        """撤回自己的语录投稿；不带名称则撤回最近一条本人投稿"""
+        group_id = str(event.message_obj.group_id)
+        user_id = str(event.get_sender_id())
+        records = self._read_submit_log()
+        # 候选：本群、本人的投稿记录
+        mine = [r for r in records if str(r.get("group_id")) == group_id]
+        mine_all = [r for r in mine if str(r.get("user_id")) == user_id]
+
+        target_filename = ""
+        if not name.strip():
+            # 无参数：取本人最新一条
+            if not mine_all:
+                yield event.plain_result("⭐您在本群没有可撤回的投稿记录")
+                event.stop_event()
+                return
+            latest = max(mine_all, key=lambda r: float(r.get("ts", 0)))
+            target_filename = latest.get("filename", "")
+        else:
+            target = self._find_quote_file(group_id, name)
+            if not target:
+                # 也支持按提交日志记录的文件名查找
+                hit = next((r for r in mine if r.get("filename") == name.strip()), None)
+                if hit:
+                    target_filename = hit.get("filename", "")
+                    target = self._group_dir(group_id) / target_filename
+                    if not target.exists():
+                        target = None
+                if not target:
+                    yield event.plain_result(f"⭐未找到名为「{name}」的语录")
+                    event.stop_event()
+                    return
+            target_filename = target.name
+            # 校验归属
+            owner = next(
+                (
+                    str(r.get("user_id"))
+                    for r in mine
+                    if r.get("filename") == target_filename
+                ),
+                None,
+            )
+            if owner is None:
+                yield event.plain_result(
+                    "⭐该语录无投稿记录，无法撤回（可联系管理员删除）"
+                )
+                event.stop_event()
+                return
+            if owner != user_id:
+                yield event.plain_result("⭐只能撤回自己投的语录")
+                event.stop_event()
+                return
+
+        file_path = self._group_dir(group_id) / target_filename
+        if file_path.exists():
+            try:
+                file_path.unlink()
+            except Exception as e:
+                logger.error(f"撤回时删除文件失败: {e}")
+                yield event.plain_result(f"⭐撤回失败：删除文件出错 {e}")
+                event.stop_event()
+                return
+        # 从日志移除对应条目
+        new_records = [
+            r
+            for r in records
+            if not (
+                str(r.get("group_id")) == group_id
+                and r.get("filename") == target_filename
+                and str(r.get("user_id")) == user_id
+            )
+        ]
+        self._rewrite_submit_log(new_records)
+        self._invalidate_shuffler(group_id)
+        yield event.plain_result(f"⭐已撤回投稿：{target_filename}")
         event.stop_event()
 
     # ------------------------------------------------------------------ #
