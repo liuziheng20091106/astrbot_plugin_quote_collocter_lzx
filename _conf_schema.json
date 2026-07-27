@@ -55,5 +55,37 @@
         "default": 2
       }
     }
+  },
+  "pity_config": {
+    "description": "保底配置",
+    "type": "object",
+    "hint": "每 N 抽必出一次对应星级，0 表示禁用该等级保底。默认每 10 抽必出一次 5 星。保底命中且本群缺某档图时，顺次按星级降序兜底。",
+    "items": {
+      "pity_5": {
+        "description": "5 星保底（每 N 抽必出）",
+        "type": "int",
+        "default": 10
+      },
+      "pity_4": {
+        "description": "4 星保底",
+        "type": "int",
+        "default": 0
+      },
+      "pity_3": {
+        "description": "3 星保底",
+        "type": "int",
+        "default": 0
+      },
+      "pity_2": {
+        "description": "2 星保底",
+        "type": "int",
+        "default": 0
+      },
+      "pity_1": {
+        "description": "1 星保底",
+        "type": "int",
+        "default": 0
+      }
+    }
   }
 }

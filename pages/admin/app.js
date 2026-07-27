@@ -51,6 +51,44 @@ function fillSettings(s) {
   $("poke_quote_probability").value = s.poke_quote_probability ?? 0.85;
   $("recent_window").value = s.recent_window ?? 8;
   renderRaritySliders(s.rarity_weights || {});
+  renderPityInputs(s.pity_config || {});
+}
+
+function renderPityInputs(pity) {
+  const wrap = $("pityGrid");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (const def of RARITY_DEFS) {
+    // weight_X → pity_X
+    const key = def.key.replace("weight_", "pity_");
+    const val = Number(pity?.[key] ?? 0);
+    const row = document.createElement("div");
+    row.className = "rarity-row";
+    row.innerHTML = `
+      <span class="rarity-name" style="color:${def.color}">${def.label}</span>
+      <input type="range" min="0" max="100" step="1" data-pity="${key}" value="${val}" />
+      <input type="number" min="0" step="1" data-pity-num="${key}" value="${val}" />
+    `;
+    const slider = row.querySelector('input[type=range]');
+    const num = row.querySelector('input[type=number]');
+    slider.addEventListener("input", () => {
+      num.value = slider.value;
+    });
+    num.addEventListener("input", () => {
+      slider.value = num.value;
+    });
+    wrap.appendChild(row);
+  }
+}
+
+function collectPity() {
+  const out = {};
+  for (const def of RARITY_DEFS) {
+    const key = def.key.replace("weight_", "pity_");
+    const num = document.querySelector(`input[data-pity-num="${key}"]`);
+    out[key] = Math.max(0, Math.round(Number(num?.value ?? 0)));
+  }
+  return out;
 }
 
 async function loadSettings() {
@@ -69,6 +107,7 @@ async function saveSettings() {
     poke_quote_probability: Number($("poke_quote_probability").value),
     recent_window: Number($("recent_window").value),
     rarity_weights: collectRarityWeights(),
+    pity_config: collectPity(),
   };
   const msg = $("settingsMsg");
   msg.classList.remove("ok", "err");

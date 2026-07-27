@@ -32,6 +32,17 @@ DEFAULT_RARITY_WEIGHTS = {
     "weight_1": 2,
 }
 
+# 默认保底配置：每 N 抽必出一次对应星级，0 表示禁用该等级保底。
+# 默认每 10 抽必出一次 5 星。保底命中时若该群没有该等级图片，
+# 顺次向下找一个存在的等级（按星级降序）。
+DEFAULT_PITY = {
+    "pity_5": 10,
+    "pity_4": 0,
+    "pity_3": 0,
+    "pity_2": 0,
+    "pity_1": 0,
+}
+
 # 支持的图片扩展名
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
@@ -95,12 +106,20 @@ class QuoteShuffler:
     抽取队列持久化到群目录下的 order.json，重启后可继续。
     """
 
-    def __init__(self, group_dir: Path, window: int, weights: dict | None = None):
+    def __init__(
+        self,
+        group_dir: Path,
+        window: int,
+        weights: dict | None = None,
+        pity: dict | None = None,
+    ):
         self.group_dir = group_dir
         self.order_file = group_dir / "order.json"
         self.window = max(1, int(window))
         # 稀有度 -> 权重，缺省按 parse_quote_rarity 的默认（1）再兜底 1.0
         self.weights = weights or {}
+        # 保底：稀有度 -> 每 N 抽必出（0 表示禁用）
+        self.pity = pity or {}
 
     def _list_images(self) -> list[str]:
         if not self.group_dir.exists():
@@ -161,8 +180,51 @@ class QuoteShuffler:
         queue = head + tail
         return {"order": queue, "index": 0}
 
+    def _pity_load(self, data: dict) -> dict:
+        """读取各星级「距上次抽出该星级」的抽数计数，缺失补 0。"""
+        since = data.get("since") or {}
+        if not isinstance(since, dict):
+            since = {}
+        return {
+            int(r): int(since.get(str(r), since.get(r, 0)) or 0)
+            for r in (1, 2, 3, 4, 5)
+        }
+
+    def _pity_pick_target(
+        self, images: list[str], min_rarity: int, exclude: set[str]
+    ) -> str | None:
+        """在 images 中找一张稀有度 >= min_rarity 的图片（优先恰好 min_rarity）。
+
+        按星级降序遍历可命中等级，在同一等级里挑不在 exclude 集合中的任一张。
+        找不到返回 None。
+        """
+        by_r: dict[int, list[str]] = {}
+        for name in images:
+            r, _ = parse_quote_rarity(name)
+            by_r.setdefault(r, []).append(name)
+        # 优先恰好该等级，其次更高等级（满足"优先等级高的，顺次往下排"的语义：
+        # 在保底要求出 >= X 时，先试 X，再 X+1... 因为高等级更稀有，命中后
+        # 仍按权重队列后续自然抽取。等级 X 不存在才升档）
+        for r in range(min_rarity, 6):
+            pool = [n for n in by_r.get(r, []) if n not in exclude]
+            if pool:
+                return random.choice(pool)
+        # 该档及以上都没有：向下顺次找
+        for r in range(min_rarity - 1, 0, -1):
+            pool = [n for n in by_r.get(r, []) if n not in exclude]
+            if pool:
+                return random.choice(pool)
+        return None
+
     def next(self) -> str | None:
-        """返回下一张语录图片的绝对路径，无可用图片时返回 None。"""
+        """返回下一张语录图片的绝对路径，无可用图片时返回 None。
+
+        保底机制：维护各星级「已连续多少抽没有出该星级」的计数。
+        每抽一次，所有启用保底的星级计数 +1。若某星级计数达到其阈值，
+        则在本次强制从队列里选取一张稀有度 >= 该档的图片（优先恰好该档，
+        该档不存在则升档；该档及以上都不存在则降档顺次求之于现有等级），
+        并把该图片从队列传过来，重置该星级计数；其它未命中的星级计数继续保留。
+        """
         images = self._list_images()
         if not images:
             return None
@@ -170,6 +232,7 @@ class QuoteShuffler:
         data = self._load()
         order = data.get("order") or []
         index = data.get("index", 0)
+        since = self._pity_load(data)
 
         # 队列与当前实际图片不一致（新增/删除/首次）时重建
         image_set = set(images)
@@ -187,9 +250,60 @@ class QuoteShuffler:
             new = self._build_order(images, avoid)
             order, index = new["order"], new["index"]
 
+        # 保底计数器累加一次（对启用保底的星级）
+        for r in (1, 2, 3, 4, 5):
+            thr = int(self.pity.get(r, 0) or 0)
+            if thr > 0:
+                since[r] = since.get(r, 0) + 1
+
+        # 保底触发判定：从高星到低星依次检查，优先命中等级最高的保底
         target = order[index]
+        bumped = False
+        triggered_r = 0
+        for r in (5, 4, 3, 2, 1):
+            thr = int(self.pity.get(r, 0) or 0)
+            if thr <= 0:
+                continue
+            if since.get(r, 0) >= thr:
+                # 该档及其以上若均无可抽图片，则保底"卡死"，保留计数不消化
+                # 增量：把 since[r] 钳到 thr（不再继续累加到天文数字），下次有图立刻触发
+                pick = self._pity_pick_target(images, r, exclude={target})
+                if pick is None:
+                    pick = self._pity_pick_target(images, r, exclude=set())
+                if pick is None:
+                    since[r] = thr  # 钳制，避免溢出
+                    continue  # 该档无图可保底，留给下一档
+                triggered_r = r
+                if pick != target:
+                    try:
+                        pick_pos = order.index(pick, index)
+                    except ValueError:
+                        pick_pos = order.index(pick)
+                    order[index], order[pick_pos] = order[pick_pos], order[index]
+                    target = order[index]
+                    bumped = True
+                # 已出货 >= r：清零该档及以上保底计数
+                for cr in range(r, 6):
+                    since[cr] = 0
+                break
+
+        # 自然出货：重置实际抽到的稀有度（及其以上）的保底计数
+        out_r, _ = parse_quote_rarity(target)
+        for cr in range(out_r, 6):
+            since[cr] = 0
+
         index += 1
-        self._save({"order": order, "index": index})
+        self._save(
+            {
+                "order": order,
+                "index": index,
+                "since": {str(k): v for k, v in since.items()},
+            }
+        )
+        if bumped and triggered_r:
+            logger.info(
+                f"保底命中：群{self.group_dir.name} 第{triggered_r}星，触发抽取 {target}"
+            )
         return str(self.group_dir / target)
 
 
@@ -250,6 +364,10 @@ class QuotePlugin(Star):
             "rarity_weights": {
                 **DEFAULT_RARITY_WEIGHTS,
                 **(self.config.get("rarity_weights") or {}),
+            },
+            "pity_config": {
+                **DEFAULT_PITY,
+                **(self.config.get("pity_config") or {}),
             },
         }
 
@@ -318,6 +436,19 @@ class QuotePlugin(Star):
             1: float(raw.get("weight_1", DEFAULT_RARITY_WEIGHTS["weight_1"]) or 1.0),
         }
 
+    def _load_pity(self) -> dict:
+        """从全局设置读取保底配置，整理成 {稀有度数字: 每 N 抽必出, 0=禁用}。"""
+        gs = self._load_global_settings()
+        raw = gs.get("pity_config") or DEFAULT_PITY
+        out = {}
+        for r in (1, 2, 3, 4, 5):
+            key = f"pity_{r}"
+            try:
+                out[r] = max(0, int(raw.get(key, DEFAULT_PITY.get(key, 0)) or 0))
+            except (TypeError, ValueError):
+                out[r] = 0
+        return out
+
     def _shuffler(self, group_id: str) -> QuoteShuffler:
         if group_id not in self._shufflers:
             gs = self._load_global_settings()
@@ -325,6 +456,7 @@ class QuotePlugin(Star):
                 self._group_dir(group_id),
                 int(gs.get("recent_window", 8)),
                 self._load_rarity_weights(),
+                self._load_pity(),
             )
         return self._shufflers[group_id]
 
@@ -1046,8 +1178,26 @@ class QuotePlugin(Star):
                         return error_response(f"{k} 不能为负")
                     cur.setdefault("rarity_weights", {})[k] = f
 
+        # 保底配置：每 N 抽必出，0 = 禁用
+        if "pity_config" in payload:
+            pc = payload["pity_config"]
+            if not isinstance(pc, dict):
+                return error_response("pity_config 必须是对象")
+            pkeys = ["pity_5", "pity_4", "pity_3", "pity_2", "pity_1"]
+            for k in pkeys:
+                if k in pc:
+                    try:
+                        iv = int(pc[k])
+                    except (TypeError, ValueError):
+                        return error_response(f"{k} 必须是整数")
+                    if iv < 0:
+                        return error_response(f"{k} 不能为负")
+                    cur.setdefault("pity_config", {})[k] = iv
+
+        # 保底配置变更后需失效缓存的 shuffler 与各群 since 计数：
+        # 直接清缓存即可（since 仍记于各群 order.json，按新阈值继续判定）
         self._save_global_settings(cur)
-        # 使已缓存的 shuffler 失效，下次重建会读取新权重/窗口
+        # 使已缓存的 shuffler 失效，下次重建会读取新权重/窗口/保底
         self._shufflers.clear()
         return json_response(cur)
 

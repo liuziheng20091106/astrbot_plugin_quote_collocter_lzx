@@ -46,6 +46,15 @@
           <!-- JS 动态生成滑块 -->
         </div>
 
+        <h3 data-i18n="pityTitle">保底配置</h3>
+        <p class="hint" data-i18n="pityHint">
+          每 N 抽必出一次对应星级，0 表示禁用该等级保底。默认每 10 抽必出一次 5 星。
+          保底命中且本群缺某档图时，顺次按星级降序兜底出图。
+        </p>
+        <div id="pityGrid" class="rarity-grid">
+          <!-- JS 动态生成保底输入 -->
+        </div>
+
         <div class="actions">
           <button id="saveSettings" data-i18n="save">保存设置</button>
           <span id="settingsMsg" class="msg"></span>
