@@ -636,7 +636,15 @@ class QuotePlugin(Star):
         return out
 
     def _find_quote_file(self, group_id: str, name: str) -> Path | None:
-        """按「完整文件名」或「展示名(标题+扩展名)」查找群目录下的语录文件。"""
+        """按多种口径查找群目录下的语录文件。
+
+        匹配顺序：
+        1. 完整文件名精确匹配（如 "1.杰克的奇妙比喻.jpg"）
+        2. 展示名匹配（"标题+扩展名"，忽略稀有度前缀，如 "杰克的奇妙比喻.jpg"）
+        3. 旧「1.<name>」形式兼容
+        4. 自动补扩展名兜底：输入未带扩展名时，
+           分别尝试 .jpg/.jpeg/.png/.bmp/.gif/.webp 等再走 1/2/3 匹配
+        """
         d = self._group_dir(group_id)
         if not d.exists():
             return None
@@ -646,19 +654,33 @@ class QuotePlugin(Star):
             if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
         ]
         target = name.strip()
-        # 1. 完整文件名精确匹配
-        for f in candidates:
-            if f.name == target:
-                return f
-        # 2. 展示名匹配（忽略稀有度前缀）
-        for f in candidates:
-            _, disp = parse_quote_rarity(f.name)
-            if disp == target:
-                return f
-        # 3. 旧「1.<target>」形式兼容
-        for f in candidates:
-            if f.name == f"1.{target}":
-                return f
+
+        def match(t: str) -> Path | None:
+            # 1. 完整文件名精确匹配
+            for f in candidates:
+                if f.name == t:
+                    return f
+            # 2. 展示名匹配（忽略稀有度前缀）
+            for f in candidates:
+                _, disp = parse_quote_rarity(f.name)
+                if disp == t:
+                    return f
+            # 3. 旧「1.<t>」形式兼容
+            for f in candidates:
+                if f.name == f"1.{t}":
+                    return f
+            return None
+
+        # 先按原样匹配
+        hit = match(target)
+        if hit:
+            return hit
+        # 输入未带扩展名时，逐一补常见扩展名再试
+        if not Path(target).suffix:
+            for ext in sorted(IMAGE_EXTENSIONS):
+                hit = match(f"{target}{ext}")
+                if hit:
+                    return hit
         return None
 
     def _invalidate_shuffler(self, group_id: str) -> None:
