@@ -369,6 +369,7 @@ class QuotePlugin(Star):
                 **DEFAULT_PITY,
                 **(self.config.get("pity_config") or {}),
             },
+            "blocked_user_ids": [],
         }
 
     def _load_global_settings(self) -> dict:
@@ -398,6 +399,28 @@ class QuotePlugin(Star):
                 json.dump(settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存全局设置失败: {e}")
+
+    def _blocked_user_ids(self) -> set[str]:
+        """读取全局语录黑名单并统一转换为字符串集合。"""
+        raw = self._load_global_settings().get("blocked_user_ids", [])
+        if not isinstance(raw, list):
+            return set()
+        return {str(user_id) for user_id in raw}
+
+    def _is_blocked_user(self, user_id: str | int) -> bool:
+        """判断用户是否被全局禁止使用语录投稿与抽卡功能。"""
+        return str(user_id) in self._blocked_user_ids()
+
+    @staticmethod
+    def _resolve_target_user_id(
+        event: AstrMessageEvent, raw_user_id: str = ""
+    ) -> str | None:
+        """解析命令中的 @用户 或数字 UID，优先取消息链中的 At 组件。"""
+        for component in event.message_obj.message:
+            if isinstance(component, Comp.At):
+                return str(component.qq)
+        user_id = raw_user_id.strip()
+        return user_id if user_id.isdigit() else None
 
     def _load_settings(self, group_id: str) -> dict:
         """读取群级设置，合并全局设置作为默认。"""
@@ -694,6 +717,12 @@ class QuotePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def random_quote(self, event: AstrMessageEvent):
         """随机查看一条本群语录"""
+        user_id = str(event.get_sender_id())
+        if self._is_blocked_user(user_id):
+            yield event.plain_result("⭐您已被语录系统拉黑，无法抽卡查看语录")
+            event.stop_event()
+            return
+
         group_id = str(event.message_obj.group_id)
         path = self._shuffler(group_id).next()
         if path:
@@ -702,6 +731,29 @@ class QuotePlugin(Star):
             yield event.plain_result(
                 "⭐本群还没有群友语录哦~\n请发送“/语录投稿+图片”来添加！"
             )
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：查看指定语录（仅管理员，不影响随机/保底状态）
+    # ------------------------------------------------------------------ #
+    @filter.command("语录查看", alias={"查看语录"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def view_quote(self, event: AstrMessageEvent, name: str = ""):
+        """直接查看本群指定语录，不推进随机抽取队列"""
+        if not name.strip():
+            yield event.plain_result("⭐用法：/语录查看 <语录名>")
+            event.stop_event()
+            return
+
+        group_id = str(event.message_obj.group_id)
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"⭐未找到名为「{name}」的语录")
+            event.stop_event()
+            return
+
+        yield event.chain_result(quote_chain(str(target)))
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -714,6 +766,12 @@ class QuotePlugin(Star):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
         msg_id = str(event.message_obj.message_id)
+
+        # 黑名单优先于投稿模式和管理员投稿权限生效
+        if self._is_blocked_user(user_id):
+            yield event.plain_result("⭐您已被语录系统拉黑，无法投稿")
+            event.stop_event()
+            return
 
         settings = self._load_settings(group_id)
         mode = int(settings.get("mode", 0))
@@ -863,6 +921,59 @@ class QuotePlugin(Star):
         settings["cooldown"] = cooldown
         self._save_settings(group_id, settings)
         yield event.plain_result(f"⭐戳戳冷却已设置为：{cooldown} 秒")
+        event.stop_event()
+
+    # ------------------------------------------------------------------ #
+    # 指令：拉黑/解封语录用户（仅管理员，全局生效）
+    # ------------------------------------------------------------------ #
+    @filter.command("语录拉黑", alias={"拉黑语录用户"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def block_quote_user(self, event: AstrMessageEvent, user: str = ""):
+        """全局拉黑用户，禁止其投稿和抽卡查看语录"""
+        target_id = self._resolve_target_user_id(event, user)
+        if not target_id:
+            yield event.plain_result("⭐用法：/语录拉黑 @用户 或 /语录拉黑 <UID>")
+            event.stop_event()
+            return
+
+        settings = self._load_global_settings()
+        blocked = self._blocked_user_ids()
+        if target_id in blocked:
+            yield event.plain_result(f"⭐用户 {target_id} 已在语录黑名单中")
+            event.stop_event()
+            return
+
+        blocked.add(target_id)
+        settings["blocked_user_ids"] = sorted(blocked)
+        self._save_global_settings(settings)
+        yield event.plain_result(
+            f"⭐已全局拉黑用户 {target_id}，其无法投稿或抽卡查看语录"
+        )
+        event.stop_event()
+
+    @filter.command("语录解封", alias={"解封语录用户", "语录取消拉黑"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def unblock_quote_user(self, event: AstrMessageEvent, user: str = ""):
+        """从全局语录黑名单中解除用户"""
+        target_id = self._resolve_target_user_id(event, user)
+        if not target_id:
+            yield event.plain_result("⭐用法：/语录解封 @用户 或 /语录解封 <UID>")
+            event.stop_event()
+            return
+
+        settings = self._load_global_settings()
+        blocked = self._blocked_user_ids()
+        if target_id not in blocked:
+            yield event.plain_result(f"⭐用户 {target_id} 不在语录黑名单中")
+            event.stop_event()
+            return
+
+        blocked.remove(target_id)
+        settings["blocked_user_ids"] = sorted(blocked)
+        self._save_global_settings(settings)
+        yield event.plain_result(f"⭐已解除用户 {target_id} 的语录黑名单限制")
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1098,6 +1209,10 @@ class QuotePlugin(Star):
             return
         # 只响应戳到 bot 自己
         if str(target_id) != str(bot_id):
+            return
+
+        # 拉黑用户的戳一戳静默忽略，且不得消耗本群冷却
+        if self._is_blocked_user(str(sender_id)):
             return
 
         group_id = str(event.message_obj.group_id)
