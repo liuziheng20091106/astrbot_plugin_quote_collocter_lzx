@@ -1484,27 +1484,22 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         if self._is_blocked_user(event.get_sender_id()):
-            yield event.plain_result("该用户已被语录系统拉黑，无法查看语录。")
-            return
+            return "该用户已被语录系统拉黑，无法查看语录。"
         try:
             rarity = int(rarity)
             page = max(1, int(page))
             page_size = min(50, max(1, int(page_size)))
         except (TypeError, ValueError):
-            yield event.plain_result("rarity、page 和 page_size 必须是整数。")
-            return
+            return "rarity、page 和 page_size 必须是整数。"
         if rarity not in (0, 1, 2, 3, 4, 5):
-            yield event.plain_result("rarity 必须是 0 到 5 之间的整数。")
-            return
+            return "rarity 必须是 0 到 5 之间的整数。"
         files = self._list_quote_files(group_id, rarity)
         total = len(files)
         pages = max(1, (total + page_size - 1) // page_size)
         if page > pages:
-            yield event.plain_result(f"页码超出范围，共 {pages} 页。")
-            return
+            return f"页码超出范围，共 {pages} 页。"
         current = files[(page - 1) * page_size : page * page_size]
         header = f"语录列表：共 {total} 张，第 {page}/{pages} 页"
         if rarity:
@@ -1515,7 +1510,7 @@ class QuotePlugin(Star):
             record = self._find_submission_record(group_id, path.name)
             submitter = f"，投稿人 {record.get('user_id')}" if record else ""
             lines.append(f"{index}. [{quote_rarity}星] {display}{submitter}")
-        yield event.plain_result("\n".join(lines))
+        return "\n".join(lines)
 
     @filter.llm_tool(name="quote_view")
     async def ai_quote_view(self, event: AstrMessageEvent, name: str):
@@ -1526,16 +1521,13 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         if self._is_blocked_user(event.get_sender_id()):
-            yield event.plain_result("该用户已被语录系统拉黑，无法查看语录。")
-            return
+            return "该用户已被语录系统拉黑，无法查看语录。"
         target = self._find_quote_file(group_id, name)
         if not target:
-            yield event.plain_result(f"未找到名为「{name}」的语录。")
-            return
-        yield event.plain_result(self._quote_detail_text(group_id, target))
+            return f"未找到名为「{name}」的语录。"
+        return self._quote_detail_text(group_id, target)
 
     @filter.llm_tool(name="quote_draw")
     async def ai_quote_draw(self, event: AstrMessageEvent):
@@ -1544,16 +1536,15 @@ class QuotePlugin(Star):
         # 空图库、加权随机、去重、保底和最终消息链都与手动指令完全一致。
         async for result in self.random_quote(event):
             await event.send(result)
-        yield event.plain_result("已完成抽卡并发送到群内。")
+        return "已完成抽卡并发送到群内。"
 
     @filter.llm_tool(name="quote_status")
     async def ai_quote_status(self, event: AstrMessageEvent):
         """查看当前群的语录数量、稀有度分布和群设置状态。"""
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
-        yield event.plain_result(self._quote_stats_text(group_id))
+            return "语录系统仅支持群聊使用。"
+        return self._quote_stats_text(group_id)
 
     @filter.llm_tool(name="quote_submit")
     async def ai_quote_submit(self, event: AstrMessageEvent, title: str = ""):
@@ -1564,12 +1555,11 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         ok, text = await self._submit_replied_quote(
             event, group_id, str(event.get_sender_id()), title
         )
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_delete")
     async def ai_quote_delete(self, event: AstrMessageEvent, name: str):
@@ -1580,17 +1570,14 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         if not self._is_admin(event):
-            yield event.plain_result("权限不足，仅 bot 管理员可删除语录。")
-            return
+            return "权限不足，仅 bot 管理员可删除语录。"
         target = self._find_quote_file(group_id, name)
         if not target:
-            yield event.plain_result(f"未找到名为「{name}」的语录。")
-            return
+            return f"未找到名为「{name}」的语录。"
         _, text = self._delete_quote_file(group_id, target)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_rename")
     async def ai_quote_rename(self, event: AstrMessageEvent, name: str, new_title: str):
@@ -1602,17 +1589,14 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         if not self._is_admin(event):
-            yield event.plain_result("权限不足，仅 bot 管理员可重命名语录。")
-            return
+            return "权限不足，仅 bot 管理员可重命名语录。"
         target = self._find_quote_file(group_id, name)
         if not target:
-            yield event.plain_result(f"未找到名为「{name}」的语录。")
-            return
+            return f"未找到名为「{name}」的语录。"
         _, text = self._rename_quote_file(group_id, target, new_title)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_set_rarity")
     async def ai_quote_set_rarity(
@@ -1626,22 +1610,18 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         if not self._is_admin(event):
-            yield event.plain_result("权限不足，仅 bot 管理员可修改稀有度。")
-            return
+            return "权限不足，仅 bot 管理员可修改稀有度。"
         target = self._find_quote_file(group_id, name)
         if not target:
-            yield event.plain_result(f"未找到名为「{name}」的语录。")
-            return
+            return f"未找到名为「{name}」的语录。"
         try:
             rarity = int(rarity)
         except (TypeError, ValueError):
-            yield event.plain_result("稀有度必须是 1 到 5 之间的整数。")
-            return
+            return "稀有度必须是 1 到 5 之间的整数。"
         _, text = self._set_quote_rarity_file(group_id, target, rarity)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_revoke")
     async def ai_quote_revoke(self, event: AstrMessageEvent, name: str = ""):
@@ -1652,8 +1632,7 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         user_id = str(event.get_sender_id())
         target = self._find_quote_file(group_id, name) if name.strip() else None
         if not target:
@@ -1664,15 +1643,14 @@ class QuotePlugin(Star):
                 and str(record.get("user_id")) == user_id
             ]
             if not records:
-                yield event.plain_result("您在本群没有可撤回的投稿记录。")
+                return "您在本群没有可撤回的投稿记录。"
                 return
             latest = max(records, key=lambda record: float(record.get("ts", 0)))
             target = self._group_dir(group_id) / str(latest.get("filename", ""))
         if not target.exists():
-            yield event.plain_result("目标投稿文件已不存在，无法撤回。")
-            return
+            return "目标投稿文件已不存在，无法撤回。"
         _, text = self._revoke_quote_file(group_id, user_id, target)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_configure_group")
     async def ai_quote_configure_group(
@@ -1689,16 +1667,13 @@ class QuotePlugin(Star):
         """
         group_id = self._tool_group_id(event)
         if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
+            return "语录系统仅支持群聊使用。"
         if not self._is_admin(event):
-            yield event.plain_result("权限不足，仅 bot 管理员可调整群设置。")
-            return
+            return "权限不足，仅 bot 管理员可调整群设置。"
         if mode is None and cooldown is None:
-            yield event.plain_result("请至少提供 mode 或 cooldown 其中一项。")
-            return
+            return "请至少提供 mode 或 cooldown 其中一项。"
         ok, text = self._apply_group_settings(group_id, mode, cooldown)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_configure_global")
     async def ai_quote_configure_global(self, event: AstrMessageEvent, settings: dict):
@@ -1708,10 +1683,9 @@ class QuotePlugin(Star):
             settings(object): 可包含投稿模式、冷却、触发概率、去重窗口、权重与保底配置
         """
         if not self._is_admin(event):
-            yield event.plain_result("权限不足，仅 bot 管理员可调整全局设置。")
-            return
+            return "权限不足，仅 bot 管理员可调整全局设置。"
         ok, text, _ = self._apply_global_settings(settings)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="quote_manage_blacklist")
     async def ai_quote_manage_blacklist(
@@ -1724,10 +1698,9 @@ class QuotePlugin(Star):
             user_id(string): 要拉黑或解封的数字 UID
         """
         if not self._is_admin(event):
-            yield event.plain_result("权限不足，仅 bot 管理员可管理黑名单。")
-            return
+            return "权限不足，仅 bot 管理员可管理黑名单。"
         _, text = self._update_blacklist(action, str(user_id))
-        yield event.plain_result(text)
+        return text
 
     # ------------------------------------------------------------------ #
     # WebUI Page 后端 API

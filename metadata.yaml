@@ -2,7 +2,7 @@ name: quote_collocter # 插件唯一识别名
 short_desc: quote_collocter优化版，遥遥领先。
 desc: 语录插件，支持群聊投稿、稀有度抽卡、投稿记录、回复管理与 AI Tools，用法请看 README。
 help: "发送 /语录 随机抽卡；回复图片发送 /语录投稿 [标题] 投稿。管理员可用 /语录查看、/语录删除、/语录改名、/语录改稀有、/语录拉黑 等命令管理。"
-version: v2.1 # 插件版本号
+version: v2.1.1 # 插件版本号
 author: TKStudio # 作者
 repo: https://github.com/liuziheng20091106/astrbot_plugin_quote_collocter_lzx # 仓库地址
 display_name: 群友语录收集
