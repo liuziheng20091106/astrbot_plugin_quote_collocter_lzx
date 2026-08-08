@@ -1534,8 +1534,15 @@ class QuotePlugin(Star):
         """按 /语录 的完整逻辑抽取并发送一张当前群语录。"""
         # 不在 AI Tool 中复制抽卡流程：直接复用 /语录 handler，保证黑名单、
         # 空图库、加权随机、去重、保底和最终消息链都与手动指令完全一致。
-        async for result in self.random_quote(event):
-            await event.send(result)
+        try:
+            async for result in self.random_quote(event):
+                await event.send(result)
+        except Exception as e:
+            logger.warning(f"AI 抽卡卡片发送失败: {e}")
+            # QQ NT 有时已成功接收发送请求，但协议端等待回执超时（retcode=1200）。
+            if "retcode=1200" in str(e):
+                return "抽卡已完成，卡片发送请求超时，请确认群内是否已收到卡片。"
+            return f"抽卡已完成，但卡片发送失败：{type(e).__name__}"
         return "已完成抽卡并发送到群内。"
 
     @filter.llm_tool(name="quote_status")
