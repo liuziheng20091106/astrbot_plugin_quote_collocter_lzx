@@ -1544,7 +1544,7 @@ class QuotePlugin(Star):
         # 空图库、加权随机、去重、保底和最终消息链都与手动指令完全一致。
         async for result in self.random_quote(event):
             await event.send(result)
-        yield event.plain_result("已按 /语录 的标准逻辑完成抽卡。")
+        yield event.plain_result("已完成抽卡并发送到群内。")
 
     @filter.llm_tool(name="quote_status")
     async def ai_quote_status(self, event: AstrMessageEvent):
