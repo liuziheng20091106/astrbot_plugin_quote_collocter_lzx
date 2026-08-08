@@ -1551,7 +1551,12 @@ class QuotePlugin(Star):
         if not path:
             yield event.plain_result("本群还没有语录。")
             return
-        yield event.plain_result(self._quote_detail_text(group_id, Path(path)))
+
+        quote_path = Path(path)
+        # llm_tool 的 yield 仅向 Agent 返回工具结果，不能替代媒体发送。
+        # 直接发送消息链，确保群内能看到实际抽中的图片。
+        await event.send(self._quote_chain_with_info(group_id, quote_path))
+        yield event.plain_result(self._quote_detail_text(group_id, quote_path))
 
     @filter.llm_tool(name="quote_status")
     async def ai_quote_status(self, event: AstrMessageEvent):
