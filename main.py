@@ -302,7 +302,8 @@ class QuoteShuffler:
         )
         if bumped and triggered_r:
             logger.info(
-                f"保底命中：群{self.group_dir.name} 第{triggered_r}星，触发抽取 {target}"
+                "保底命中："
+                f"群{self.group_dir.name} 第{triggered_r}星，触发抽取 {target}"
             )
         return str(self.group_dir / target)
 
@@ -551,6 +552,26 @@ class QuotePlugin(Star):
             logger.error(f"下载图片异常: {e}")
             return None
 
+    async def _get_replied_message_chain(self, event: AstrMessageEvent):
+        """读取被回复消息的原始消息链，未引用或读取失败时返回 None。"""
+        reply = next(
+            (
+                component
+                for component in event.message_obj.message
+                if isinstance(component, Comp.Reply)
+            ),
+            None,
+        )
+        if not reply:
+            return None
+        try:
+            reply_id = int(reply.id) if str(reply.id).isdigit() else reply.id
+            reply_msg = await event.bot.api.call_action("get_msg", message_id=reply_id)
+            return reply_msg.get("message") if reply_msg else None
+        except Exception as e:
+            logger.error(f"获取引用消息失败: {e}")
+            return None
+
     async def _resolve_reply_image_file(
         self, event: AstrMessageEvent
     ) -> tuple[str, str] | None:
@@ -559,30 +580,20 @@ class QuotePlugin(Star):
         兼容数组/ CQ 码两种格式。扩展名优先取图 URL 后缀，否则取 file 字段后缀，
         无法判断时回退到 .jpg。
         """
-        reply = next(
-            (c for c in event.message_obj.message if isinstance(c, Comp.Reply)), None
-        )
-        if not reply:
+        chain = await self._get_replied_message_chain(event)
+        if not chain:
             return None
-        try:
-            reply_id = int(reply.id) if str(reply.id).isdigit() else reply.id
-            reply_msg = await event.bot.api.call_action("get_msg", message_id=reply_id)
-            if not reply_msg or "message" not in reply_msg:
-                return None
-            chain = reply_msg["message"]
-            parts = chain if isinstance(chain, list) else []
-            for part in parts:
-                if isinstance(part, dict) and part.get("type") == "image":
-                    data = part.get("data", {}) or {}
-                    file_id = data.get("file")
-                    ext = self._detect_ext(data.get("url"), data.get("file"))
-                    return file_id, ext
-            if isinstance(chain, str):
-                m = re.search(r"\[CQ:image,[^\]]*file=([^,\]]+)", chain)
-                if m:
-                    return m.group(1), self._detect_ext(None, m.group(1))
-        except Exception as e:
-            logger.error(f"获取引用消息图片失败: {e}")
+        parts = chain if isinstance(chain, list) else []
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "image":
+                data = part.get("data", {}) or {}
+                file_id = data.get("file")
+                ext = self._detect_ext(data.get("url"), data.get("file"))
+                return file_id, ext
+        if isinstance(chain, str):
+            m = re.search(r"\[CQ:image,[^\]]*file=([^,\]]+)", chain)
+            if m:
+                return m.group(1), self._detect_ext(None, m.group(1))
         return None
 
     @staticmethod
@@ -596,6 +607,48 @@ class QuotePlugin(Star):
                 if lower.endswith(ext):
                     return ext
         return ".jpg"
+
+    async def _resolve_reply_quote_file(
+        self, event: AstrMessageEvent, group_id: str
+    ) -> Path | None:
+        """从被回复的 bot 语录卡片中解析并验证本群语录文件。
+
+        优先使用图片段携带的文件路径；再使用卡片 Plain 文本的最后一行
+        （即展示文件名）。所有候选都必须经 _find_quote_file 验证。
+        """
+        chain = await self._get_replied_message_chain(event)
+        if not chain:
+            return None
+
+        candidates: list[str] = []
+        if isinstance(chain, list):
+            for part in chain:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "image":
+                    data = part.get("data", {}) or {}
+                    for source in (data.get("file"), data.get("url")):
+                        if source:
+                            candidates.append(Path(str(source).split("?", 1)[0]).name)
+                elif part.get("type") in {"text", "plain"}:
+                    text = str((part.get("data", {}) or {}).get("text", ""))
+                    if text:
+                        # /语录查看 会在文件名后追加投稿人和投稿时间；
+                        # 因此逐行加入候选，不假设文件名永远在最后一行。
+                        candidates.extend(
+                            line.strip() for line in text.splitlines() if line.strip()
+                        )
+        elif isinstance(chain, str):
+            image_match = re.search(r"\[CQ:image,[^\]]*file=([^,\]]+)", chain)
+            if image_match:
+                candidates.append(Path(image_match.group(1)).name)
+
+        for name in candidates:
+            if name:
+                target = self._find_quote_file(group_id, name)
+                if target:
+                    return target
+        return None
 
     def _log_submission(
         self, group_id: str, user_id: str, filename: str, ts: float
@@ -645,6 +698,89 @@ class QuotePlugin(Star):
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.error(f"重写投稿日志失败: {e}")
+
+    def _find_submission_record(self, group_id: str, filename: str) -> dict | None:
+        """返回本群指定文件最新的一条投稿记录。"""
+        records = [
+            record
+            for record in self._read_submit_log()
+            if str(record.get("group_id")) == str(group_id)
+            and record.get("filename") == filename
+        ]
+        if not records:
+            return None
+        return max(records, key=lambda record: float(record.get("ts", 0)))
+
+    def _remove_submission_records(self, group_id: str, filename: str) -> None:
+        """删除本群指定文件的全部投稿记录。"""
+        records = self._read_submit_log()
+        self._rewrite_submit_log(
+            [
+                record
+                for record in records
+                if not (
+                    str(record.get("group_id")) == str(group_id)
+                    and record.get("filename") == filename
+                )
+            ]
+        )
+
+    def _rename_submission_records(
+        self, group_id: str, old_filename: str, new_filename: str
+    ) -> None:
+        """同步更新改名或改稀有度后的投稿记录文件名。"""
+        records = self._read_submit_log()
+        changed = False
+        for record in records:
+            if (
+                str(record.get("group_id")) == str(group_id)
+                and record.get("filename") == old_filename
+            ):
+                record["filename"] = new_filename
+                changed = True
+        if changed:
+            self._rewrite_submit_log(records)
+
+    def _submission_info_text(self, group_id: str, filename: str) -> str:
+        """生成语录的投稿信息文本；不存在记录时返回空字符串。"""
+        record = self._find_submission_record(group_id, filename)
+        if not record:
+            return ""
+        return (
+            f"\n投稿人：{record.get('user_id', '未知')}"
+            f"\n投稿时间：{record.get('time', '未知')}"
+        )
+
+    def _quote_info_text(self, group_id: str, path: Path) -> str:
+        """生成卡片文本及可用的投稿信息。"""
+        rarity, display = parse_quote_rarity(path.name)
+        submission = self._submission_info_text(group_id, path.name)
+        return f"{RARITY_TEXT[rarity]}\n{display}{submission}"
+
+    def _quote_chain_with_info(self, group_id: str, path: Path) -> list:
+        """构建包含投稿信息的「文字在前、图片在后」语录消息链。"""
+        return [
+            Comp.Plain(text=self._quote_info_text(group_id, path)),
+            Comp.Image.fromFileSystem(str(path)),
+        ]
+
+    def _quote_detail_text(self, group_id: str, path: Path) -> str:
+        """生成供指令与 AI 共用的语录文字详情。"""
+        return self._quote_info_text(group_id, path)
+
+    def _list_quote_files(self, group_id: str, rarity: int = 0) -> list[Path]:
+        """列出本群语录，可按 1-5 星筛选，并按文件名稳定排序。"""
+        d = self._group_dir(group_id)
+        if not d.exists():
+            return []
+        files = [
+            f
+            for f in d.iterdir()
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        if rarity in RARITY_TEXT:
+            files = [f for f in files if parse_quote_rarity(f.name)[0] == rarity]
+        return sorted(files, key=lambda path: path.name)
 
     def _existing_displays(self, group_id: str) -> set[str]:
         """返回该群已存在的「标题+扩展名」集合（忽略稀有度前缀 1-5）。"""
@@ -710,6 +846,120 @@ class QuotePlugin(Star):
         """删除已缓存的 shuffler，使下次抽取按新文件列表重建队列。"""
         self._shufflers.pop(str(group_id), None)
 
+    def _delete_quote_file(self, group_id: str, target: Path) -> tuple[bool, str]:
+        """删除语录文件及其投稿记录，并使随机队列失效。"""
+        try:
+            filename = target.name
+            target.unlink()
+            self._remove_submission_records(group_id, filename)
+            self._invalidate_shuffler(group_id)
+            return True, f"⭐已删除语录：{filename}"
+        except Exception as e:
+            logger.error(f"删除语录失败: {e}")
+            return False, f"⭐删除失败: {e}"
+
+    def _rename_quote_file(
+        self, group_id: str, target: Path, new_title: str
+    ) -> tuple[bool, str]:
+        """重命名语录标题，并同步投稿日志。"""
+        new_title = new_title.strip()
+        if not new_title:
+            return False, "⭐新标题不能为空"
+        rarity, _ = parse_quote_rarity(target.name)
+        ext = target.suffix
+        new_display = f"{new_title}{ext}"
+        if new_display in self._existing_displays(group_id):
+            return False, f"⭐改名失败：已存在同名语录「{new_title}」，请换一个标题"
+        new_path = target.with_name(f"{rarity}.{new_title}{ext}")
+        if new_path.exists():
+            return False, "⭐改名失败：目标文件已存在"
+        try:
+            old_filename = target.name
+            target.rename(new_path)
+            self._rename_submission_records(group_id, old_filename, new_path.name)
+            self._invalidate_shuffler(group_id)
+            return True, f"⭐已重命名：\n{old_filename} → {new_path.name}"
+        except Exception as e:
+            logger.error(f"重命名失败: {e}")
+            return False, f"⭐改名失败: {e}"
+
+    def _set_quote_rarity_file(
+        self, group_id: str, target: Path, rarity: int
+    ) -> tuple[bool, str]:
+        """修改语录稀有度前缀，并同步投稿日志。"""
+        if rarity not in RARITY_TEXT:
+            return False, "⭐稀有度只能是 1-5"
+        ext = target.suffix
+        stem = target.stem.split(".", 1)[1] if "." in target.stem else target.stem
+        new_path = target.with_name(f"{rarity}.{stem}{ext}")
+        if new_path == target:
+            return True, f"⭐稀有度已是 {rarity}，无需修改"
+        if new_path.exists():
+            return False, "⭐改稀有度失败：目标文件名已存在"
+        try:
+            old_filename = target.name
+            target.rename(new_path)
+            self._rename_submission_records(group_id, old_filename, new_path.name)
+            self._invalidate_shuffler(group_id)
+            return True, f"⭐已修改稀有度：\n{old_filename} → {new_path.name}"
+        except Exception as e:
+            logger.error(f"改稀有度失败: {e}")
+            return False, f"⭐改稀有度失败: {e}"
+
+    def _revoke_quote_file(
+        self, group_id: str, user_id: str, target: Path
+    ) -> tuple[bool, str]:
+        """撤回用户自己的语录投稿，校验归属后删除文件与投稿记录。"""
+        record = self._find_submission_record(group_id, target.name)
+        if not record:
+            return False, "⭐该语录无投稿记录，无法撤回（可联系管理员删除）"
+        if str(record.get("user_id")) != str(user_id):
+            return False, "⭐只能撤回自己投的语录"
+        try:
+            target.unlink()
+            self._remove_submission_records(group_id, target.name)
+            self._invalidate_shuffler(group_id)
+            return True, f"⭐已撤回投稿：{target.name}"
+        except Exception as e:
+            logger.error(f"撤回时删除文件失败: {e}")
+            return False, f"⭐撤回失败：删除文件出错 {e}"
+
+    async def _submit_replied_quote(
+        self, event: AstrMessageEvent, group_id: str, user_id: str, title: str
+    ) -> tuple[bool, str]:
+        """保存回复图片为语录，复用投稿权限、重名和日志规则。"""
+        if self._is_blocked_user(user_id):
+            return False, "⭐您已被语录系统拉黑，无法投稿"
+        settings = self._load_settings(group_id)
+        mode = int(settings.get("mode", 0))
+        if mode == 0:
+            return False, "⭐投稿系统未开启，请联系 bot 管理员使用 /投稿权限 开启"
+        if mode == 1 and not self._is_admin(event):
+            return False, "⭐权限不足，当前仅 bot 管理员可投稿"
+
+        resolved = await self._resolve_reply_image_file(event)
+        if not resolved:
+            return False, "⭐请回复一条含图消息后再投稿"
+        file_id, ext = resolved
+        ts = time.time()
+        stem = title.strip() or time.strftime(
+            "%Y年%m月%d日%H:%M的投稿", time.localtime(ts)
+        )
+        filename = f"1.{stem}{ext}"
+        if f"{stem}{ext}" in self._existing_displays(group_id):
+            return False, f"⭐投稿失败：已存在同名语录「{stem}」，请改个标题重试"
+
+        path = await self._download_image(event, file_id, group_id, filename)
+        if not path or not os.path.exists(path):
+            return False, "⭐语录投稿失败，图片下载失败"
+        self._log_submission(group_id, user_id, filename, ts)
+        return (
+            True,
+            "⭐语录投稿成功！\n"
+            "请确认您的投稿格式正确（聊天记录截屏）。\n"
+            "如果投稿有误，请使用「/撤回投稿 <名称>」取消投稿。",
+        )
+
     # ------------------------------------------------------------------ #
     # 指令：随机查看一条语录
     # ------------------------------------------------------------------ #
@@ -753,7 +1003,7 @@ class QuotePlugin(Star):
             event.stop_event()
             return
 
-        yield event.chain_result(quote_chain(str(target)))
+        yield event.chain_result(self._quote_chain_with_info(group_id, target))
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -766,29 +1016,8 @@ class QuotePlugin(Star):
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
         msg_id = str(event.message_obj.message_id)
-
-        # 黑名单优先于投稿模式和管理员投稿权限生效
-        if self._is_blocked_user(user_id):
-            yield event.plain_result("⭐您已被语录系统拉黑，无法投稿")
-            event.stop_event()
-            return
-
-        settings = self._load_settings(group_id)
-        mode = int(settings.get("mode", 0))
-        if mode == 0:
-            yield event.plain_result(
-                "⭐投稿系统未开启，请联系 bot 管理员使用 /投稿权限 开启"
-            )
-            event.stop_event()
-            return
-        if mode == 1 and not self._is_admin(event):
-            yield event.plain_result("⭐权限不足，当前仅 bot 管理员可投稿")
-            event.stop_event()
-            return
-
-        # 必须（也仅）通过回复一条含图消息来投稿
-        resolved = await self._resolve_reply_image_file(event)
-        if not resolved:
+        ok, text = await self._submit_replied_quote(event, group_id, user_id, title)
+        if not ok and "请回复一条含图消息" in text:
             yield event.chain_result(
                 [
                     Comp.At(qq=user_id),
@@ -800,56 +1029,8 @@ class QuotePlugin(Star):
                     ),
                 ]
             )
-            event.stop_event()
-            return
-        file_id, ext = resolved
-
-        # 决定文件名：未给标题则用“xxxx年xx月xx日xx:xx的投稿”
-        ts = time.time()
-        if title:
-            stem = title.strip()
         else:
-            stem = time.strftime("%Y年%m月%d日%H:%M的投稿", time.localtime(ts))
-        filename = f"1.{stem}{ext}"
-
-        # 重名检测：已存在相同「标题+扩展名」的语录（忽略稀有度前缀 1-5）则拒绝
-        new_display = f"{stem}{ext}"
-        existing_displays = self._existing_displays(group_id)
-        if new_display in existing_displays:
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=msg_id),
-                    Comp.Plain(
-                        text=(
-                            f"⭐投稿失败：已存在同名语录「{stem}」，请改个标题重试。\n"
-                            "如确需覆盖，请联系管理员使用 /语录删除 <名称> 删除后再投稿。"
-                        )
-                    ),
-                ]
-            )
-            event.stop_event()
-            return
-
-        path = await self._download_image(event, file_id, group_id, filename)
-        if path and os.path.exists(path):
-            # 投稿成功，写入投稿日志
-            self._log_submission(group_id, user_id, filename, ts)
-            yield event.chain_result(
-                [
-                    Comp.Reply(id=msg_id),
-                    Comp.Plain(
-                        text=(
-                            "⭐语录投稿成功！\n"
-                            "请确认您的投稿格式正确（聊天记录截屏）。\n"
-                            "如果投稿有误，请使用「/撤回投稿 <名称>」取消投稿。"
-                        )
-                    ),
-                ]
-            )
-        else:
-            yield event.chain_result(
-                [Comp.Reply(id=msg_id), Comp.Plain(text="⭐语录投稿失败，图片下载失败")]
-            )
+            yield event.chain_result([Comp.Reply(id=msg_id), Comp.Plain(text=text)])
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -891,17 +1072,15 @@ class QuotePlugin(Star):
     async def set_submit_mode(self, event: AstrMessageEvent, mode: int):
         """设置投稿权限模式：0=关闭 1=仅管理员 2=全体"""
         group_id = str(event.message_obj.group_id)
-        if mode not in (0, 1, 2):
+        ok, text = self._apply_group_settings(group_id, mode=mode)
+        if not ok:
             yield event.plain_result(
                 "⭐模式只能是 0、1、2\n  0：关闭\n  1：仅管理员\n  2：全体成员"
             )
             event.stop_event()
             return
-        settings = self._load_settings(group_id)
-        settings["mode"] = mode
-        self._save_settings(group_id, settings)
-        text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}[mode]
-        yield event.plain_result(f"⭐投稿权限已设置为：{text}")
+        mode_text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}[mode]
+        yield event.plain_result(f"⭐投稿权限已设置为：{mode_text}")
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -913,13 +1092,11 @@ class QuotePlugin(Star):
     async def set_poke_cooldown(self, event: AstrMessageEvent, cooldown: int):
         """设置戳一戳触发语录的冷却时间（秒）"""
         group_id = str(event.message_obj.group_id)
-        if cooldown < 0:
+        ok, text = self._apply_group_settings(group_id, cooldown=cooldown)
+        if not ok:
             yield event.plain_result("⭐冷却时间不能为负数")
             event.stop_event()
             return
-        settings = self._load_settings(group_id)
-        settings["cooldown"] = cooldown
-        self._save_settings(group_id, settings)
         yield event.plain_result(f"⭐戳戳冷却已设置为：{cooldown} 秒")
         event.stop_event()
 
@@ -937,19 +1114,12 @@ class QuotePlugin(Star):
             event.stop_event()
             return
 
-        settings = self._load_global_settings()
-        blocked = self._blocked_user_ids()
-        if target_id in blocked:
-            yield event.plain_result(f"⭐用户 {target_id} 已在语录黑名单中")
-            event.stop_event()
-            return
-
-        blocked.add(target_id)
-        settings["blocked_user_ids"] = sorted(blocked)
-        self._save_global_settings(settings)
-        yield event.plain_result(
-            f"⭐已全局拉黑用户 {target_id}，其无法投稿或抽卡查看语录"
-        )
+        ok, text = self._update_blacklist("block", target_id)
+        if ok:
+            text = f"⭐{text[:-1]}，其无法投稿或抽卡查看语录"
+        else:
+            text = f"⭐{text}"
+        yield event.plain_result(text)
         event.stop_event()
 
     @filter.command("语录解封", alias={"解封语录用户", "语录取消拉黑"})
@@ -963,17 +1133,12 @@ class QuotePlugin(Star):
             event.stop_event()
             return
 
-        settings = self._load_global_settings()
-        blocked = self._blocked_user_ids()
-        if target_id not in blocked:
-            yield event.plain_result(f"⭐用户 {target_id} 不在语录黑名单中")
-            event.stop_event()
-            return
-
-        blocked.remove(target_id)
-        settings["blocked_user_ids"] = sorted(blocked)
-        self._save_global_settings(settings)
-        yield event.plain_result(f"⭐已解除用户 {target_id} 的语录黑名单限制")
+        ok, text = self._update_blacklist("unblock", target_id)
+        if ok:
+            text = f"⭐{text}"
+        else:
+            text = f"⭐{text}"
+        yield event.plain_result(text)
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -983,26 +1148,19 @@ class QuotePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def delete_quote(self, event: AstrMessageEvent, name: str = ""):
-        """按名称删除一条本群语录（可传完整文件名或展示名）"""
+        """按名称或回复 bot 语录卡片删除一条本群语录"""
         group_id = str(event.message_obj.group_id)
-        if not name.strip():
+        target = await self._resolve_reply_quote_file(event, group_id)
+        if not target and name.strip():
+            target = self._find_quote_file(group_id, name)
+        if not target:
             yield event.plain_result(
-                "⭐请输入要删除的语录名称，例如 /语录删除 杰克的奇妙比喻.jpg"
+                "⭐用法：/语录删除 <名称>，或回复 bot 的语录卡片后直接发送 /语录删除"
             )
             event.stop_event()
             return
-        target = self._find_quote_file(group_id, name)
-        if not target:
-            yield event.plain_result(f"⭐未找到名为「{name}」的语录")
-            event.stop_event()
-            return
-        try:
-            target.unlink()
-            self._invalidate_shuffler(group_id)
-            yield event.plain_result(f"⭐已删除语录：{target.name}")
-        except Exception as e:
-            logger.error(f"删除语录失败: {e}")
-            yield event.plain_result(f"⭐删除失败: {e}")
+        _, text = self._delete_quote_file(group_id, target)
+        yield event.plain_result(text)
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1012,45 +1170,28 @@ class QuotePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def rename_quote(self, event: AstrMessageEvent, old: str = "", new: str = ""):
-        """重命名语录的标题部分，保留稀有度前缀与扩展名"""
-        # 由于指令以空格分参，若新标题含空格需手动重组
-        raw = event.message_str
-        parts = raw.split(maxsplit=2)[1:]  # 去掉指令名
-        old = parts[0] if len(parts) > 0 else ""
-        new = parts[1].strip() if len(parts) > 1 else ""
+        """重命名语录，支持回复 bot 语录卡片后仅提供新标题"""
         group_id = str(event.message_obj.group_id)
-        if not old or not new:
+        raw_parts = event.message_str.split(maxsplit=1)
+        argument = raw_parts[1].strip() if len(raw_parts) > 1 else ""
+        target = await self._resolve_reply_quote_file(event, group_id)
+        if target:
+            new = argument
+        else:
+            parts = argument.split(maxsplit=1)
+            old = parts[0] if parts else ""
+            new = parts[1].strip() if len(parts) > 1 else ""
+            target = self._find_quote_file(group_id, old) if old else None
+
+        if not target or not new:
             yield event.plain_result(
-                "⭐用法：/语录改名 <旧名称> <新标题>\n新标题可包含空格，但勿与已有语录重名"
+                "⭐用法：/语录改名 <旧名称> <新标题>；\n"
+                "或回复 bot 的语录卡片后发送 /语录改名 <新标题>"
             )
             event.stop_event()
             return
-        target = self._find_quote_file(group_id, old)
-        if not target:
-            yield event.plain_result(f"⭐未找到名为「{old}」的语录")
-            event.stop_event()
-            return
-        rarity, _ = parse_quote_rarity(target.name)
-        ext = target.suffix
-        new_display = f"{new}{ext}"
-        if new_display in self._existing_displays(group_id):
-            yield event.plain_result(
-                f"⭐改名失败：已存在同名语录「{new}」，请换一个标题"
-            )
-            event.stop_event()
-            return
-        new_path = target.with_name(f"{rarity}.{new}{ext}")
-        if new_path.exists():
-            yield event.plain_result(f"⭐改名失败：目标文件已存在")
-            event.stop_event()
-            return
-        try:
-            target.rename(new_path)
-            self._invalidate_shuffler(group_id)
-            yield event.plain_result(f"⭐已重命名：\n{target.name} → {new_path.name}")
-        except Exception as e:
-            logger.error(f"重命名失败: {e}")
-            yield event.plain_result(f"⭐改名失败: {e}")
+        _, text = self._rename_quote_file(group_id, target, new)
+        yield event.plain_result(text)
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1062,10 +1203,24 @@ class QuotePlugin(Star):
     async def change_rarity(
         self, event: AstrMessageEvent, name: str = "", rarity: str = ""
     ):
-        """修改语录稀有度前缀（1-5）"""
+        """修改语录稀有度，支持回复 bot 语录卡片后仅提供星级"""
         group_id = str(event.message_obj.group_id)
-        if not name.strip() or not rarity.strip():
-            yield event.plain_result("⭐用法：/语录改稀有 <名称> <1-5>")
+        raw_parts = event.message_str.split(maxsplit=1)
+        argument = raw_parts[1].strip() if len(raw_parts) > 1 else ""
+        target = await self._resolve_reply_quote_file(event, group_id)
+        if target:
+            rarity = argument
+        else:
+            parts = argument.split(maxsplit=1)
+            name = parts[0] if parts else ""
+            rarity = parts[1].strip() if len(parts) > 1 else ""
+            target = self._find_quote_file(group_id, name) if name else None
+
+        if not target or not rarity:
+            yield event.plain_result(
+                "⭐用法：/语录改稀有 <名称> <1-5>；\n"
+                "或回复 bot 的语录卡片后发送 /语录改稀有 <1-5>"
+            )
             event.stop_event()
             return
         try:
@@ -1074,36 +1229,8 @@ class QuotePlugin(Star):
             yield event.plain_result("⭐稀有度必须是 1-5 的整数")
             event.stop_event()
             return
-        if r not in RARITY_TEXT:
-            yield event.plain_result("⭐稀有度只能是 1-5")
-            event.stop_event()
-            return
-        target = self._find_quote_file(group_id, name)
-        if not target:
-            yield event.plain_result(f"⭐未找到名为「{name}」的语录")
-            event.stop_event()
-            return
-        ext = target.suffix
-        # 标题部分（不含稀有度数字），标题可能含点，仅按首个点分割
-        stem = target.stem.split(".", 1)[1] if "." in target.stem else target.stem
-        new_path = target.with_name(f"{r}.{stem}{ext}")
-        if new_path == target:
-            yield event.plain_result(f"⭐稀有度已是 {r}，无需修改")
-            event.stop_event()
-            return
-        if new_path.exists():
-            yield event.plain_result(f"⭐改稀有度失败：目标文件名已存在")
-            event.stop_event()
-            return
-        try:
-            target.rename(new_path)
-            self._invalidate_shuffler(group_id)
-            yield event.plain_result(
-                f"⭐已修改稀有度：\n{target.name} → {new_path.name}"
-            )
-        except Exception as e:
-            logger.error(f"改稀有度失败: {e}")
-            yield event.plain_result(f"⭐改稀有度失败: {e}")
+        _, text = self._set_quote_rarity_file(group_id, target, r)
+        yield event.plain_result(text)
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1112,80 +1239,42 @@ class QuotePlugin(Star):
     @filter.command("撤回投稿", alias={"取消投稿", "撤回语录"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def revoke_quote(self, event: AstrMessageEvent, name: str = ""):
-        """撤回自己的语录投稿；不带名称则撤回最近一条本人投稿"""
+        """撤回自己的投稿；可回复 bot 语录卡片，不带目标时撤回最新一条"""
         group_id = str(event.message_obj.group_id)
         user_id = str(event.get_sender_id())
-        records = self._read_submit_log()
-        # 候选：本群、本人的投稿记录
-        mine = [r for r in records if str(r.get("group_id")) == group_id]
-        mine_all = [r for r in mine if str(r.get("user_id")) == user_id]
-
-        target_filename = ""
-        if not name.strip():
-            # 无参数：取本人最新一条
-            if not mine_all:
-                yield event.plain_result("⭐您在本群没有可撤回的投稿记录")
-                event.stop_event()
-                return
-            latest = max(mine_all, key=lambda r: float(r.get("ts", 0)))
-            target_filename = latest.get("filename", "")
-        else:
+        target = await self._resolve_reply_quote_file(event, group_id)
+        if not target and name.strip():
             target = self._find_quote_file(group_id, name)
-            if not target:
-                # 也支持按提交日志记录的文件名查找
-                hit = next((r for r in mine if r.get("filename") == name.strip()), None)
-                if hit:
-                    target_filename = hit.get("filename", "")
-                    target = self._group_dir(group_id) / target_filename
-                    if not target.exists():
-                        target = None
-                if not target:
-                    yield event.plain_result(f"⭐未找到名为「{name}」的语录")
-                    event.stop_event()
-                    return
-            target_filename = target.name
-            # 校验归属
-            owner = next(
-                (
-                    str(r.get("user_id"))
-                    for r in mine
-                    if r.get("filename") == target_filename
-                ),
-                None,
-            )
-            if owner is None:
+
+        if not target:
+            if name.strip() or any(
+                isinstance(component, Comp.Reply)
+                for component in event.message_obj.message
+            ):
                 yield event.plain_result(
-                    "⭐该语录无投稿记录，无法撤回（可联系管理员删除）"
+                    "⭐未找到目标语录；可回复 bot 的语录卡片后发送 /撤回投稿"
                 )
                 event.stop_event()
                 return
-            if owner != user_id:
-                yield event.plain_result("⭐只能撤回自己投的语录")
+            records = [
+                record
+                for record in self._read_submit_log()
+                if str(record.get("group_id")) == group_id
+                and str(record.get("user_id")) == user_id
+            ]
+            if not records:
+                yield event.plain_result("⭐您在本群没有可撤回的投稿记录")
+                event.stop_event()
+                return
+            latest = max(records, key=lambda record: float(record.get("ts", 0)))
+            target = self._group_dir(group_id) / str(latest.get("filename", ""))
+            if not target.exists():
+                yield event.plain_result("⭐最近一条投稿文件已不存在，无法撤回")
                 event.stop_event()
                 return
 
-        file_path = self._group_dir(group_id) / target_filename
-        if file_path.exists():
-            try:
-                file_path.unlink()
-            except Exception as e:
-                logger.error(f"撤回时删除文件失败: {e}")
-                yield event.plain_result(f"⭐撤回失败：删除文件出错 {e}")
-                event.stop_event()
-                return
-        # 从日志移除对应条目
-        new_records = [
-            r
-            for r in records
-            if not (
-                str(r.get("group_id")) == group_id
-                and r.get("filename") == target_filename
-                and str(r.get("user_id")) == user_id
-            )
-        ]
-        self._rewrite_submit_log(new_records)
-        self._invalidate_shuffler(group_id)
-        yield event.plain_result(f"⭐已撤回投稿：{target_filename}")
+        _, text = self._revoke_quote_file(group_id, user_id, target)
+        yield event.plain_result(text)
         event.stop_event()
 
     # ------------------------------------------------------------------ #
@@ -1255,6 +1344,398 @@ class QuotePlugin(Star):
         except Exception:
             return False
 
+    def _tool_group_id(self, event: AstrMessageEvent) -> str | None:
+        """返回 AI tool 所在群号；私聊场景返回 None。"""
+        group_id = str(getattr(event.message_obj, "group_id", "") or "")
+        return group_id or None
+
+    def _quote_stats_text(self, group_id: str) -> str:
+        """生成本群语录统计文本，供指令与 AI tool 使用。"""
+        files = self._list_quote_files(group_id)
+        counts = {rarity: 0 for rarity in RARITY_TEXT}
+        for path in files:
+            rarity, _ = parse_quote_rarity(path.name)
+            counts[rarity] += 1
+        settings = self._load_settings(group_id)
+        mode_text = {0: "关闭", 1: "仅管理员", 2: "全体成员"}.get(
+            int(settings.get("mode", 0)), "未知"
+        )
+        rarity_text = "、".join(
+            f"{rarity}星 {counts[rarity]} 张" for rarity in sorted(counts, reverse=True)
+        )
+        return (
+            f"本群语录共 {len(files)} 张\n"
+            f"稀有度分布：{rarity_text}\n"
+            f"投稿权限：{mode_text}\n"
+            f"戳戳冷却：{int(settings.get('cooldown', 10))} 秒"
+        )
+
+    def _apply_group_settings(
+        self, group_id: str, mode: int | None = None, cooldown: int | None = None
+    ) -> tuple[bool, str]:
+        """校验并更新本群投稿模式与戳戳冷却。"""
+        settings = self._load_settings(group_id)
+        try:
+            if mode is not None:
+                mode = int(mode)
+                if mode not in (0, 1, 2):
+                    return False, "投稿权限模式只能是 0、1、2"
+                settings["mode"] = mode
+            if cooldown is not None:
+                cooldown = int(cooldown)
+                if cooldown < 0:
+                    return False, "戳戳冷却不能为负数"
+                settings["cooldown"] = cooldown
+        except (TypeError, ValueError):
+            return False, "群设置项必须是整数"
+        self._save_settings(group_id, settings)
+        return True, "群设置已保存"
+
+    def _update_blacklist(self, action: str, user_id: str) -> tuple[bool, str]:
+        """更新全局语录黑名单，action 为 block 或 unblock。"""
+        if action not in {"block", "unblock"} or not user_id.isdigit():
+            return False, "action 必须是 block/unblock，user_id 必须是数字 UID。"
+        settings = self._load_global_settings()
+        blocked = self._blocked_user_ids()
+        if action == "block":
+            if user_id in blocked:
+                return False, f"用户 {user_id} 已在黑名单中。"
+            blocked.add(user_id)
+            text = f"已全局拉黑用户 {user_id}。"
+        else:
+            if user_id not in blocked:
+                return False, f"用户 {user_id} 不在黑名单中。"
+            blocked.remove(user_id)
+            text = f"已解除用户 {user_id} 的黑名单限制。"
+        settings["blocked_user_ids"] = sorted(blocked)
+        self._save_global_settings(settings)
+        return True, text
+
+    def _apply_global_settings(self, payload: dict) -> tuple[bool, str, dict]:
+        """校验并保存全局设置，供 WebUI 与 AI 共用。"""
+        if not isinstance(payload, dict):
+            return False, "请求体必须是 JSON 对象", {}
+        cur = self._load_global_settings()
+        try:
+            if "default_submit_mode" in payload:
+                value = int(payload["default_submit_mode"])
+                if value not in (0, 1, 2):
+                    return False, "default_submit_mode 必须是 0/1/2", cur
+                cur["default_submit_mode"] = value
+            if "default_cooldown" in payload:
+                value = int(payload["default_cooldown"])
+                if value < 0:
+                    return False, "default_cooldown 不能为负数", cur
+                cur["default_cooldown"] = value
+            if "poke_quote_probability" in payload:
+                value = float(payload["poke_quote_probability"])
+                if not 0 <= value <= 1:
+                    return False, "poke_quote_probability 必须在 0~1 之间", cur
+                cur["poke_quote_probability"] = value
+            if "recent_window" in payload:
+                value = int(payload["recent_window"])
+                if value < 1:
+                    return False, "recent_window 必须 >= 1", cur
+                cur["recent_window"] = value
+            if "rarity_weights" in payload:
+                weights = payload["rarity_weights"]
+                if not isinstance(weights, dict):
+                    return False, "rarity_weights 必须是对象", cur
+                for key in ("weight_5", "weight_4", "weight_3", "weight_2", "weight_1"):
+                    if key in weights:
+                        value = float(weights[key])
+                        if value < 0:
+                            return False, f"{key} 不能为负", cur
+                        cur.setdefault("rarity_weights", {})[key] = value
+            if "pity_config" in payload:
+                pity = payload["pity_config"]
+                if not isinstance(pity, dict):
+                    return False, "pity_config 必须是对象", cur
+                for key in ("pity_5", "pity_4", "pity_3", "pity_2", "pity_1"):
+                    if key in pity:
+                        value = int(pity[key])
+                        if value < 0:
+                            return False, f"{key} 不能为负", cur
+                        cur.setdefault("pity_config", {})[key] = value
+        except (TypeError, ValueError):
+            return False, "设置项类型无效", cur
+
+        self._save_global_settings(cur)
+        self._shufflers.clear()
+        return True, "全局设置已保存", cur
+
+    # ------------------------------------------------------------------ #
+    # AI 语录 Tools
+    # ------------------------------------------------------------------ #
+    @filter.llm_tool(name="quote_list")
+    async def ai_quote_list(
+        self,
+        event: AstrMessageEvent,
+        rarity: int = 0,
+        page: int = 1,
+        page_size: int = 10,
+    ):
+        """查看当前群的语录列表，支持按稀有度筛选和分页。
+
+        Args:
+            rarity(number): 稀有度筛选，0为全部，1到5为对应星级
+            page(number): 页码，从1开始
+            page_size(number): 每页条数，1到50
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if self._is_blocked_user(event.get_sender_id()):
+            yield event.plain_result("该用户已被语录系统拉黑，无法查看语录。")
+            return
+        try:
+            rarity = int(rarity)
+            page = max(1, int(page))
+            page_size = min(50, max(1, int(page_size)))
+        except (TypeError, ValueError):
+            yield event.plain_result("rarity、page 和 page_size 必须是整数。")
+            return
+        if rarity not in (0, 1, 2, 3, 4, 5):
+            yield event.plain_result("rarity 必须是 0 到 5 之间的整数。")
+            return
+        files = self._list_quote_files(group_id, rarity)
+        total = len(files)
+        pages = max(1, (total + page_size - 1) // page_size)
+        if page > pages:
+            yield event.plain_result(f"页码超出范围，共 {pages} 页。")
+            return
+        current = files[(page - 1) * page_size : page * page_size]
+        header = f"语录列表：共 {total} 张，第 {page}/{pages} 页"
+        if rarity:
+            header += f"，筛选 {rarity} 星"
+        lines = [header]
+        for index, path in enumerate(current, start=(page - 1) * page_size + 1):
+            quote_rarity, display = parse_quote_rarity(path.name)
+            record = self._find_submission_record(group_id, path.name)
+            submitter = f"，投稿人 {record.get('user_id')}" if record else ""
+            lines.append(f"{index}. [{quote_rarity}星] {display}{submitter}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.llm_tool(name="quote_view")
+    async def ai_quote_view(self, event: AstrMessageEvent, name: str):
+        """查看当前群指定语录的详细信息。
+
+        Args:
+            name(string): 语录名称，可填写完整文件名、展示名或不带扩展名的标题
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if self._is_blocked_user(event.get_sender_id()):
+            yield event.plain_result("该用户已被语录系统拉黑，无法查看语录。")
+            return
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"未找到名为「{name}」的语录。")
+            return
+        yield event.plain_result(self._quote_detail_text(group_id, target))
+
+    @filter.llm_tool(name="quote_draw")
+    async def ai_quote_draw(self, event: AstrMessageEvent):
+        """从当前群随机抽取一张语录，使用正常的权重、去重和保底机制。"""
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if self._is_blocked_user(event.get_sender_id()):
+            yield event.plain_result("该用户已被语录系统拉黑，无法抽卡查看语录。")
+            return
+        path = self._shuffler(group_id).next()
+        if not path:
+            yield event.plain_result("本群还没有语录。")
+            return
+        yield event.plain_result(self._quote_detail_text(group_id, Path(path)))
+
+    @filter.llm_tool(name="quote_status")
+    async def ai_quote_status(self, event: AstrMessageEvent):
+        """查看当前群的语录数量、稀有度分布和群设置状态。"""
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        yield event.plain_result(self._quote_stats_text(group_id))
+
+    @filter.llm_tool(name="quote_submit")
+    async def ai_quote_submit(self, event: AstrMessageEvent, title: str = ""):
+        """将用户回复的一张图片投稿到当前群语录库。
+
+        Args:
+            title(string): 可选标题，留空时使用投稿时间命名
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        ok, text = await self._submit_replied_quote(
+            event, group_id, str(event.get_sender_id()), title
+        )
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_delete")
+    async def ai_quote_delete(self, event: AstrMessageEvent, name: str):
+        """删除当前群的一条语录，仅 bot 管理员可执行。
+
+        Args:
+            name(string): 要删除的语录名称
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足，仅 bot 管理员可删除语录。")
+            return
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"未找到名为「{name}」的语录。")
+            return
+        _, text = self._delete_quote_file(group_id, target)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_rename")
+    async def ai_quote_rename(self, event: AstrMessageEvent, name: str, new_title: str):
+        """重命名当前群一条语录，仅 bot 管理员可执行。
+
+        Args:
+            name(string): 原语录名称
+            new_title(string): 新标题，不包含稀有度和扩展名
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足，仅 bot 管理员可重命名语录。")
+            return
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"未找到名为「{name}」的语录。")
+            return
+        _, text = self._rename_quote_file(group_id, target, new_title)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_set_rarity")
+    async def ai_quote_set_rarity(
+        self, event: AstrMessageEvent, name: str, rarity: int
+    ):
+        """修改当前群一条语录的稀有度，仅 bot 管理员可执行。
+
+        Args:
+            name(string): 语录名称
+            rarity(number): 目标稀有度，1到5
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足，仅 bot 管理员可修改稀有度。")
+            return
+        target = self._find_quote_file(group_id, name)
+        if not target:
+            yield event.plain_result(f"未找到名为「{name}」的语录。")
+            return
+        try:
+            rarity = int(rarity)
+        except (TypeError, ValueError):
+            yield event.plain_result("稀有度必须是 1 到 5 之间的整数。")
+            return
+        _, text = self._set_quote_rarity_file(group_id, target, rarity)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_revoke")
+    async def ai_quote_revoke(self, event: AstrMessageEvent, name: str = ""):
+        """撤回当前对话发起人自己的投稿；不填名称时撤回最新一条。
+
+        Args:
+            name(string): 可选的语录名称
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        user_id = str(event.get_sender_id())
+        target = self._find_quote_file(group_id, name) if name.strip() else None
+        if not target:
+            records = [
+                record
+                for record in self._read_submit_log()
+                if str(record.get("group_id")) == group_id
+                and str(record.get("user_id")) == user_id
+            ]
+            if not records:
+                yield event.plain_result("您在本群没有可撤回的投稿记录。")
+                return
+            latest = max(records, key=lambda record: float(record.get("ts", 0)))
+            target = self._group_dir(group_id) / str(latest.get("filename", ""))
+        if not target.exists():
+            yield event.plain_result("目标投稿文件已不存在，无法撤回。")
+            return
+        _, text = self._revoke_quote_file(group_id, user_id, target)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_configure_group")
+    async def ai_quote_configure_group(
+        self,
+        event: AstrMessageEvent,
+        mode: int | None = None,
+        cooldown: int | None = None,
+    ):
+        """调整当前群投稿模式或戳戳冷却，仅 bot 管理员可执行。
+
+        Args:
+            mode(number): 可选，投稿模式，0关闭、1仅管理员、2全体成员
+            cooldown(number): 可选，戳戳冷却秒数，不能为负数
+        """
+        group_id = self._tool_group_id(event)
+        if not group_id:
+            yield event.plain_result("语录系统仅支持群聊使用。")
+            return
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足，仅 bot 管理员可调整群设置。")
+            return
+        if mode is None and cooldown is None:
+            yield event.plain_result("请至少提供 mode 或 cooldown 其中一项。")
+            return
+        ok, text = self._apply_group_settings(group_id, mode, cooldown)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_configure_global")
+    async def ai_quote_configure_global(self, event: AstrMessageEvent, settings: dict):
+        """调整语录系统全局设置，仅 bot 管理员可执行。
+
+        Args:
+            settings(object): 可包含投稿模式、冷却、触发概率、去重窗口、权重与保底配置
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足，仅 bot 管理员可调整全局设置。")
+            return
+        ok, text, _ = self._apply_global_settings(settings)
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="quote_manage_blacklist")
+    async def ai_quote_manage_blacklist(
+        self, event: AstrMessageEvent, action: str, user_id: str
+    ):
+        """管理全局语录黑名单，仅 bot 管理员可执行。
+
+        Args:
+            action(string): 操作，只能是 block 或 unblock
+            user_id(string): 要拉黑或解封的数字 UID
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("权限不足，仅 bot 管理员可管理黑名单。")
+            return
+        _, text = self._update_blacklist(action, str(user_id))
+        yield event.plain_result(text)
+
     # ------------------------------------------------------------------ #
     # WebUI Page 后端 API
     # ------------------------------------------------------------------ #
@@ -1263,80 +1744,12 @@ class QuotePlugin(Star):
         return json_response(self._load_global_settings())
 
     async def web_save_settings(self):
-        """保存全局设置，校验后写回并使已缓存的 shuffler 失效。"""
+        """保存全局设置，复用与 AI tool 相同的校验规则。"""
         payload = await request.json(default={})
-        if not isinstance(payload, dict):
-            return error_response("请求体必须是 JSON 对象")
-
-        cur = self._load_global_settings()
-
-        # 默认投稿权限模式
-        if "default_submit_mode" in payload:
-            v = payload["default_submit_mode"]
-            if int(v) not in (0, 1, 2):
-                return error_response("default_submit_mode 必须是 0/1/2")
-            cur["default_submit_mode"] = int(v)
-
-        # 默认冷却（秒）
-        if "default_cooldown" in payload:
-            v = payload["default_cooldown"]
-            if int(v) < 0:
-                return error_response("default_cooldown 不能为负数")
-            cur["default_cooldown"] = int(v)
-
-        # 戳一戳触发概率
-        if "poke_quote_probability" in payload:
-            v = payload["poke_quote_probability"]
-            if not (0 <= float(v) <= 1):
-                return error_response("poke_quote_probability 必须在 0~1 之间")
-            cur["poke_quote_probability"] = float(v)
-
-        # 去重窗口
-        if "recent_window" in payload:
-            v = payload["recent_window"]
-            if int(v) < 1:
-                return error_response("recent_window 必须 >= 1")
-            cur["recent_window"] = int(v)
-
-        # 稀有度权重
-        if "rarity_weights" in payload:
-            rw = payload["rarity_weights"]
-            if not isinstance(rw, dict):
-                return error_response("rarity_weights 必须是对象")
-            keys = ["weight_5", "weight_4", "weight_3", "weight_2", "weight_1"]
-            for k in keys:
-                if k in rw:
-                    val = rw[k]
-                    try:
-                        f = float(val)
-                    except (TypeError, ValueError):
-                        return error_response(f"{k} 必须是数字")
-                    if f < 0:
-                        return error_response(f"{k} 不能为负")
-                    cur.setdefault("rarity_weights", {})[k] = f
-
-        # 保底配置：每 N 抽必出，0 = 禁用
-        if "pity_config" in payload:
-            pc = payload["pity_config"]
-            if not isinstance(pc, dict):
-                return error_response("pity_config 必须是对象")
-            pkeys = ["pity_5", "pity_4", "pity_3", "pity_2", "pity_1"]
-            for k in pkeys:
-                if k in pc:
-                    try:
-                        iv = int(pc[k])
-                    except (TypeError, ValueError):
-                        return error_response(f"{k} 必须是整数")
-                    if iv < 0:
-                        return error_response(f"{k} 不能为负")
-                    cur.setdefault("pity_config", {})[k] = iv
-
-        # 保底配置变更后需失效缓存的 shuffler 与各群 since 计数：
-        # 直接清缓存即可（since 仍记于各群 order.json，按新阈值继续判定）
-        self._save_global_settings(cur)
-        # 使已缓存的 shuffler 失效，下次重建会读取新权重/窗口/保底
-        self._shufflers.clear()
-        return json_response(cur)
+        ok, text, settings = self._apply_global_settings(payload)
+        if not ok:
+            return error_response(text)
+        return json_response(settings)
 
     async def web_submit_log(self):
         """返回投稿日志（JSONL 解析），支持按群号过滤和限制条数。"""
