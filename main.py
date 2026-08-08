@@ -1539,24 +1539,12 @@ class QuotePlugin(Star):
 
     @filter.llm_tool(name="quote_draw")
     async def ai_quote_draw(self, event: AstrMessageEvent):
-        """从当前群随机抽取一张语录，使用正常的权重、去重和保底机制。"""
-        group_id = self._tool_group_id(event)
-        if not group_id:
-            yield event.plain_result("语录系统仅支持群聊使用。")
-            return
-        if self._is_blocked_user(event.get_sender_id()):
-            yield event.plain_result("该用户已被语录系统拉黑，无法抽卡查看语录。")
-            return
-        path = self._shuffler(group_id).next()
-        if not path:
-            yield event.plain_result("本群还没有语录。")
-            return
-
-        quote_path = Path(path)
-        # llm_tool 的 yield 仅向 Agent 返回工具结果，不能替代媒体发送。
-        # 直接发送消息链，确保群内能看到实际抽中的图片。
-        await event.send(self._quote_chain_with_info(group_id, quote_path))
-        yield event.plain_result(self._quote_detail_text(group_id, quote_path))
+        """按 /语录 的完整逻辑抽取并发送一张当前群语录。"""
+        # 不在 AI Tool 中复制抽卡流程：直接复用 /语录 handler，保证黑名单、
+        # 空图库、加权随机、去重、保底和最终消息链都与手动指令完全一致。
+        async for result in self.random_quote(event):
+            await event.send(result)
+        yield event.plain_result("已按 /语录 的标准逻辑完成抽卡。")
 
     @filter.llm_tool(name="quote_status")
     async def ai_quote_status(self, event: AstrMessageEvent):
